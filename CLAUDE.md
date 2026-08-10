@@ -22,7 +22,16 @@ open CmdPilot.xcodeproj       # then build/run target CmdPilotHelper in Xcode (�
 ./deploy.sh                  # Release build → ~/Applications/CmdPilot Helper.app → restart launchd agent
 ./script/macpilotctl.sh      # status|start|stop|restart|logs|open|url|install|sync-web|unsync-web
 ./script/macpilotctl.sh sync-web   # web-only edits: rsync Web/ → App Support override, NO rebuild
+./script/watchdog.sh check   # 헬퍼가 '살아 있는데 서빙은 안 하는' 상태인지 (🟢/🔴)
 ```
+
+- **폰에서 접속이 안 될 때는 `docs/CONNECTION.md` 런북부터**. 요약: 주소는
+  `https://pilot.cmdspace.work`이고 **tailnet 전용**(A레코드 = 이 맥의 Tailscale IP,
+  헬퍼가 :443에서 Let's Encrypt로 직접 TLS) — 폰에 Tailscale이 켜져 있어야 한다.
+  맥에서 자기 Tailscale IP로 찌르는 테스트는 하이핀 불가라 **항상 실패하는 오탐**이니,
+  loopback + 올바른 SNI(`--resolve`)로 확인할 것. 헬퍼가 소켓만 쥔 채 accept를 안 하는
+  먹통 상태가 실제로 34시간 무음 장애를 냈고(2026-08-10), `script/watchdog.sh`가
+  OmniControl `cmdpilot-watchdog` 잡(5분)으로 그걸 자동 복구한다.
 
 - **Web-only changes never need a rebuild**: the server serves files from
   `~/Library/Application Support/CmdPilot/web/` first (if present), then the bundle. `sync-web`
@@ -94,6 +103,12 @@ gestures and deck interactions, opens the WebSocket, and emits the flat JSON com
 - The port is the `port` constant in `HelperServer.swift`. **On this machine it is 8766** —
   8765 is permanently taken by the OmniControl bridge (`~/DEV/OmniControl/bridge/server.py`).
   `deploy.sh` auto-detects the constant for its final URL echo.
+- **OmniControl 연동 (t:"omni" / t:"csess")** — `OmniBridge.swift`가 데몬(127.0.0.1:8765)
+  `/state`를 토큰 서버사이드 주입으로 프록시(토큰은 폰에 절대 안 내려감). 에이전트 탭 상단
+  "대기 결정 카드"(#sess-cards)가 pending+notifications를 병합 렌더, 카드 탭 → 세션 상세 시트
+  (#sess-sheet): `cmux read-screen/send/send-key --workspace|--surface`로 **포커스 안 뺏는**
+  세션별 화면 읽기(3초 폴)+프롬프트 전송. 키는 화이트리스트(enter/escape/ctrl+c/up/down/tab),
+  타깃은 UUID 검증. cmux state 페이로드에 `sessions[]`(전 워크스페이스의 터미널) 추가됨.
 - Deck personalization lives server-side in `~/Library/Application Support/CmdPilot/deck.json`;
   on connect the phone adopts the server deck whenever it has `folders` (server wins over the
   phone's localStorage cache), so seeding/editing that file is how you preconfigure devices.

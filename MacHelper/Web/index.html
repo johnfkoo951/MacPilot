@@ -36,6 +36,10 @@
     <symbol id="i-cmux" viewBox="0 0 24 24"><path d="M4.5 6.5l5 5.5-5 5.5M12.5 18.5h7"/></symbol>
     <!-- herdr 에이전트 상태 (활동 펄스) -->
     <symbol id="i-herdr" viewBox="0 0 24 24"><path d="M2.5 12h3.2l2-6.5 3.4 13 2.6-9.5 1.7 5h5.6"/></symbol>
+    <!-- 받아쓰기 (텍스트 커서 + 입력줄) — OmniControl 딕테이션 -->
+    <symbol id="i-dictation" viewBox="0 0 24 24"><path d="M9.5 4.5h5M12 4.5v15M9.5 19.5h5"/><path d="M3.5 9.5v5M6.5 8v8M17.5 8v8M20.5 9.5v5"/></symbol>
+    <!-- 세션 검색 (돋보기) -->
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5L20.5 20.5"/></symbol>
     <!-- 앱 내 창 전환 / 창 되돌리기 (macwindow.on.rectangle 계열) -->
     <symbol id="i-window-next" viewBox="0 0 24 24"><rect x="2.8" y="7.6" width="12.6" height="11.6" rx="2.4"/><path d="M2.8 10.9h12.6M5.4 9.25h.01M7.4 9.25h.01"/><path d="M8.2 7.6V6.2A2.4 2.4 0 0 1 10.6 3.8h7.2a2.4 2.4 0 0 1 2.4 2.4v7.2a2.4 2.4 0 0 1-2.4 2.4H16"/></symbol>
     <symbol id="i-window-back" viewBox="0 0 24 24"><rect x="2.6" y="4.6" width="18.8" height="14.8" rx="2.6"/><path d="M2.6 8.3h18.8M5.4 6.45h.01M7.4 6.45h.01"/><path d="M13.2 16l-2.5-2.5 2.5-2.5M10.7 13.5h4.3a2.2 2.2 0 0 1 0 4.4h-.6"/></symbol>
@@ -50,16 +54,9 @@
     <button id="settings-btn" class="gear" aria-label="설정"><svg class="icn"><use href="#i-sliders"/></svg></button>
   </header>
 
-  <!-- 도킹(태블릿) 레이아웃 컨트롤 바: 패널 배치 + 트랙패드 분할 조절 (도킹 시에만 표시) -->
+  <!-- 도킹(태블릿) 레이아웃 컨트롤 바: 컴패니언 + 트랙패드 분할 조절 (도킹 시에만 표시)
+       패널 전환은 하단 탭바가 담당 — 여기 중복 배치 버튼을 두면 iPad에서 내비게이션이 이중이 된다. -->
   <div id="dock-bar">
-    <div class="dock-seg" id="dock-panels" aria-label="패널 배치">
-      <button data-tab="deck">덱</button>
-      <button data-tab="keyboard">키보드</button>
-      <button data-tab="agent">cmux</button>
-      <button data-tab="herdr">herdr</button>
-      <button data-tab="term">터미널</button>
-      <button data-tab="mirror">미러</button>
-    </div>
     <span class="dock-bar-spacer"></span>
     <!-- 컴패니언 슬롯(왼쪽/위)에 무엇을 둘지: 트랙패드 · 키보드 · 없음(활성 패널 풀) -->
     <div class="dock-seg" id="dock-companion" aria-label="컴패니언 슬롯">
@@ -109,9 +106,9 @@
 
     <!-- 에이전트 (cmux · Claude Code 원격 조종) -->
     <section id="panel-agent" class="panel">
-      <div class="agent-sec cmux-head"><span id="mux-title">cmux — 창 · 워크스페이스 · 탭</span><button id="cmux-refresh" aria-label="새로고침">↻</button></div>
-      <div id="cmux-remote" class="cmux-remote"><div class="cmux-empty">cmux 상태 불러오는 중…</div></div>
-      <div class="agent-sec">제어</div>
+      <!-- 대기 결정 카드 — OmniControl pending + cmux notifications 병합 (핵심 모바일 경험) -->
+      <div id="sess-cards" class="sess-cards"></div>
+      <div class="agent-sec">제어 (맥에서 포커스된 세션에 전송)</div>
       <div class="agent-grid g3">
         <button class="agent-btn big" data-act="key" data-key="36">⏎<span>입력 · 승인</span></button>
         <button class="agent-btn big" data-act="key" data-key="53">esc<span>중단</span></button>
@@ -124,22 +121,18 @@
         <button class="agent-btn" data-act="phrase" data-text="y">y ⏎</button>
         <button class="agent-btn" data-act="phrase" data-text="n">n ⏎</button>
       </div>
-      <div class="agent-sec">빠른 지시 (입력 후 자동 ⏎)</div>
-      <div class="agent-grid g2">
-        <button class="agent-btn ph" data-act="phrase" data-text="계속해줘">계속해줘</button>
-        <button class="agent-btn ph" data-act="phrase" data-text="지금까지 진행상황 요약해줘">진행상황 요약</button>
-        <button class="agent-btn ph" data-act="phrase" data-text="/compact">/compact</button>
-        <button class="agent-btn ph" data-act="phrase" data-text="/clear">/clear</button>
-        <button class="agent-btn ph" data-act="phrase" data-text="테스트 돌리고 결과 알려줘">테스트 실행</button>
-        <button class="agent-btn ph" data-act="phrase" data-text="변경사항 커밋해줘">커밋해줘</button>
-      </div>
+      <div class="agent-sec cmux-head"><span>빠른 지시 (입력 후 자동 ⏎)</span><button id="qp-edit" aria-label="빠른 지시 편집">✎ 편집</button></div>
+      <!-- 일반적인 에이전트 작업 흐름 기본값 · ✎로 직접 편집 (localStorage) -->
+      <div id="quick-phrases" class="agent-grid g2"></div>
+      <div class="agent-sec cmux-head"><span id="mux-title">cmux — 창 · 워크스페이스 · 탭</span><button id="cmux-refresh" aria-label="새로고침">↻</button></div>
+      <div id="cmux-remote" class="cmux-remote"><div class="cmux-empty">cmux 상태 불러오는 중…</div></div>
       <div class="agent-sec">터미널 앱 열기</div>
       <div class="agent-grid g3">
         <button class="agent-btn" data-act="launch" data-target="/Applications/cmux.app">❯ cmux</button>
         <button class="agent-btn" data-act="launch" data-target="/Applications/Ghostty.app">❯ Ghostty</button>
         <button class="agent-btn" data-act="launch" data-target="/Applications/Orca.app">❯ Orca</button>
       </div>
-      <div class="agent-note">문구는 맥에서 포커스된 창에 타이핑됩니다 — cmux/터미널을 앞에 두고 쓰세요 · herdr는 Ghostty 안에서 실행</div>
+      <div class="agent-note">카드 탭 = 세션 시트(화면 보고 답장) · 제어/문구는 맥에서 포커스된 창에 타이핑 · 음성은 하단 퀵바(음성 지시/받아쓰기, 탭=토글)</div>
     </section>
 
     <!-- 덱 -->
@@ -178,6 +171,22 @@
         <input id="mirror-input" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="send" aria-label="미러 키보드 입력">
       </div>
       <button id="mirror-exit" aria-label="전체화면 종료">✕ 나가기</button>
+    </section>
+
+    <!-- 세션 검색 (OmniControl 세션 코퍼스 — 전 Claude Code 세션 풀텍스트 + 폴더 브라우즈) -->
+    <section id="panel-search" class="panel">
+      <div class="srch-bar">
+        <svg class="icn srch-icn"><use href="#i-search"/></svg>
+        <input id="srch-input" placeholder="전 세션 검색 — 살아있든 닫혔든 (2자 이상)"
+               enterkeyhint="search" autocomplete="off" autocapitalize="off"
+               autocorrect="off" spellcheck="false">
+        <button id="srch-clear" aria-label="지우기" hidden>✕</button>
+      </div>
+      <div id="srch-recent" class="srch-recent"></div>
+      <div id="srch-results" class="srch-results">
+        <div class="cmux-empty">불러오는 중…</div>
+      </div>
+      <div class="agent-note">결과 탭 = 맥에서 그 세션 열기 (닫힌 세션은 같은 폴더에서 자동 부활)</div>
     </section>
 
     <!-- 터미널 (포커스된 cmux 터미널 화면 — 텍스트 UI만) -->
@@ -231,34 +240,81 @@
     <div id="dock-splitter" aria-label="트랙패드 크기 조절"><span class="dock-grip"></span></div>
   </main>
 
-  <!-- 퀵바: 자주 쓰는 시스템 단축키 (스트림덱 스타일, 모든 탭에서 상시 노출) -->
+  <!-- 퀵바: 자주 쓰는 시스템 단축키 (스트림덱 스타일, 모든 탭에서 상시 노출)
+       음성 = OmniControl 두 레인 (탭 한 번 = 토글 시작, 다시 탭 = 종료):
+       · 음성지시 ⌃⌥⌘Space → STT→확인 카드→cmux 세션 주입
+       · 받아쓰기 ⌃⌥⌘B → STT→맥 프론트 앱 커서 삽입 -->
+  <div id="quickwrap">
   <div id="quickbar">
-    <button data-act="key" data-key="49" data-mods="option" aria-label="superwhisper"><svg class="icn"><use href="#i-mic"/></svg><span>위스퍼</span></button>
+    <button id="qb-voice" data-act="key" data-key="49" data-mods="control,option,command" aria-label="음성 지시 (OmniControl PTT 토글)"><svg class="icn"><use href="#i-mic"/></svg><span>음성 지시</span></button>
+    <button id="qb-dict" data-act="key" data-key="11" data-mods="control,option,command" aria-label="받아쓰기 (OmniControl 딕테이션 토글 ⌃⌥⌘B)"><svg class="icn"><use href="#i-dictation"/></svg><span>받아쓰기</span></button>
     <button data-act="key" data-key="49" data-mods="shift" aria-label="Raycast"><svg class="icn"><use href="#i-bolt"/></svg><span>Raycast</span></button>
     <button data-act="key" data-key="48" data-mods="command" aria-label="앱 전환"><svg class="icn"><use href="#i-appswitch"/></svg><span>앱 전환</span></button>
     <button data-act="launch" data-target="/System/Applications/Mission Control.app" aria-label="미션 컨트롤"><svg class="icn"><use href="#i-mission"/></svg><span>미션</span></button>
     <button data-act="capmenu" aria-label="캡처 메뉴"><svg class="icn"><use href="#i-camera"/></svg><span>캡처</span></button>
   </div>
 
-  <!-- 퀵바 2줄: 자주 여는 볼트/앱 + 앱내 창 전환 -->
+  <!-- 퀵바 2줄: 자주 여는 볼트/앱 + 앱내 창 전환. 볼트명은 기기별 설정에만 저장한다. -->
   <div id="quickbar2">
-    <button data-act="launch" data-target="obsidian://open?vault=CMDSPACE_Local_MBP" aria-label="메인 볼트"><svg class="icn solid"><use href="#i-obsidian"/></svg><span>볼트</span></button>
-    <button data-act="launch" data-target="obsidian://open?vault=CMDS_LLM_Wiki" aria-label="위키 볼트"><svg class="icn solid"><use href="#i-obsidian"/></svg><span>위키</span></button>
+    <button data-act="launch" data-vault-slot="primary" aria-label="Obsidian 볼트 1"><svg class="icn solid"><use href="#i-obsidian"/></svg><span>볼트 1</span></button>
+    <button data-act="launch" data-vault-slot="secondary" aria-label="Obsidian 볼트 2"><svg class="icn solid"><use href="#i-obsidian"/></svg><span>볼트 2</span></button>
     <button data-act="launch" data-target="/Applications/cmux.app" aria-label="cmux"><svg class="icn"><use href="#i-cmux"/></svg><span>cmux</span></button>
     <button data-act="window" data-dir="next" aria-label="앱 내 다음 창"><svg class="icn"><use href="#i-window-next"/></svg><span>다음 창</span></button>
     <button data-act="window" data-dir="prev" aria-label="앱 내 이전 창"><svg class="icn"><use href="#i-window-back"/></svg><span>이전 창</span></button>
   </div>
+  </div><!-- /quickwrap -->
 
+  <!-- herdr 전용 탭은 제거 — 상태는 cmux 탭 트리의 상태 점, 화면은 터미널 탭의 cmux/herdr 스위치로 수렴 -->
   <nav id="tabbar">
-    <button class="tab" data-tab="keyboard"><svg class="icn"><use href="#i-keyboard"/></svg>키보드</button>
-    <button class="tab" data-tab="agent"><svg class="icn"><use href="#i-cmux"/></svg>cmux</button>
-    <button class="tab" data-tab="herdr"><svg class="icn"><use href="#i-herdr"/></svg>herdr</button>
+    <button class="tab" data-tab="agent"><svg class="icn"><use href="#i-cmux"/></svg>에이전트</button>
+    <button class="tab" data-tab="search"><svg class="icn"><use href="#i-search"/></svg>검색</button>
     <button class="tab" data-tab="term"><svg class="icn"><use href="#i-terminal"/></svg>터미널</button>
+    <button class="tab" data-tab="keyboard"><svg class="icn"><use href="#i-keyboard"/></svg>키보드</button>
     <button class="tab" data-tab="mirror"><svg class="icn"><use href="#i-mirror"/></svg>미러</button>
     <button class="tab active" data-tab="deck"><svg class="icn"><use href="#i-grid"/></svg>덱</button>
   </nav>
 
   <div id="modal-root"></div>
+
+  <!-- 음성 상태 필: 맥에서 지금 어떤 레인(음성 지시/받아쓰기)이 녹음·인식 중인지 -->
+  <div id="voice-pill" hidden></div>
+
+  <!-- PTT 전송 확인 (OmniControl 카드의 모바일 미러): 어느 탭에서든 뜨는 상단 배너.
+       음성 지시 후 인식 결과 + 세션 선택 — 표시되는 순간 hold로 맥 카운트다운을 멈춘다. -->
+  <div id="ptt-banner" hidden>
+    <div class="pb-head">🎙 전송 대기 — 세션 선택</div>
+    <div id="pb-text" class="pb-text"></div>
+    <div id="pb-sessions" class="pb-sessions"></div>
+    <div class="pb-foot">
+      <button id="pb-send" class="pb-primary">기본 타깃으로 전송</button>
+      <button id="pb-cancel">취소</button>
+    </div>
+  </div>
+
+  <!-- 세션 상세 시트: 포커스 안 뺏는 화면 읽기 + 세션별 프롬프트 전송 -->
+  <div id="sess-sheet" hidden>
+    <div class="ss-head">
+      <div class="ss-titles">
+        <div id="ss-title">세션</div>
+        <div id="ss-sub" class="ss-sub"></div>
+      </div>
+      <button id="ss-goto" title="맥에서 이 세션으로 전환">전환</button>
+      <button id="ss-close" aria-label="닫기">✕</button>
+    </div>
+    <pre id="ss-term">화면 불러오는 중…</pre>
+    <div class="ss-keys">
+      <button data-k="enter">⏎ 승인</button>
+      <button data-k="escape">esc</button>
+      <button data-k="ctrl+c">⌃C</button>
+      <button data-k="up">↑</button>
+      <button data-k="down">↓</button>
+      <button data-k="tab">⇥</button>
+    </div>
+    <div class="ss-input-row">
+      <textarea id="ss-input" rows="2" placeholder="이 세션에 프롬프트 보내기 (전송 시 ⏎ 자동)"></textarea>
+      <button id="ss-send">전송</button>
+    </div>
+  </div>
 
   <script src="/app.js"></script>
 </body>

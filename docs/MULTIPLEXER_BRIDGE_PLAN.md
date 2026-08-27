@@ -1,9 +1,9 @@
 # 다중 멀티플렉서 브리지 — 기획 보고
 
 > 목표: `CmuxBridge`(cmux 전용)를 **tmux · Zellij · Herdr · cmux · Orca**를 어댑터로 갈아끼우는
-> **다중 백엔드 브리지**로 일반화할지 검토. 각 앱의 **API 방식**을 MacPilot의 5-op 계약에 매핑.
-> 근거: 사용자 볼트 fact-check본(2026-07-08) + 공식 문서 대조 조사 5건 + 적대적 검증 5건(환각 색출 포함).
-> "여러 개를 써도 좋다" → 결론은 **하나 고르기가 아니라 어댑터로 쌓기**("정답은 조합" 명제 그대로).
+> **다중 백엔드 브리지**로 일반화할지 검토. 각 앱의 **API 방식**을 CmdPilot의 5-op 계약에 매핑.
+> 근거: 공식 문서 대조 조사 5건 + 적대적 검증 5건(환각 색출 포함).
+> 결론은 **하나 고르기가 아니라 어댑터로 쌓기**다.
 
 ---
 
@@ -77,7 +77,7 @@
 - **공수 S** (이미 구현). 하드닝은 별도 S~M.
 
 ### Orca — 기술적으론 되나 자사 앱과 중복 (보류)
-- **검증이 볼트 비관론 반박**: `orca terminal list/read/send/switch/wait`가 계약에 ~1:1 매핑, 전부 `--json`, cmux와 동일한 CLI 셸아웃 → 공수 M. `terminal read`는 스크롤백+커서 페이징(재시작에도 생존).
+- **검증 결과**: `orca terminal list/read/send/switch/wait`가 계약에 ~1:1 매핑, 전부 `--json`, cmux와 동일한 CLI 셸아웃 → 공수 M. `terminal read`는 스크롤백+커서 페이징(재시작에도 생존).
 - **검증 교정**: ⚠️ `orca tab profile list`는 **발명**(→ `orca tab list`). handle은 **runtime-scoped라 stale** → op마다 재획득 필요. CLI는 **Experimental**.
 - **⑤**: `tui-idle`만 문서화, working/blocked/done enum 없음 → 합성 필요.
 - **전략적 중복 ★**: Orca가 **이미 1급 iOS/Android 컴패니언 앱**("폰에서 에이전트 감시·조종 + 완료 알림")을 판다 = **MacPilot 용도와 정면 중복**. 깨끗한 상태 신호도 CLI가 아니라 자사 앱에만 감.
@@ -113,13 +113,13 @@ enum BridgeRouter {
 
 **자동 감지**: 각 어댑터의 `available`(CLI 경로/소켓 존재)로 **설치된 것만** 폰에 노출.
 
-**보안**: 모든 백엔드가 로컬 무인증(또는 로컬 password) → **폰 게이트는 MacPilot 자신의 레이어**(동사 화이트리스트 + PIN). **화이트리스트는 백엔드별로** 정의(각 CLI의 위험 표면이 다름).
+**보안**: 모든 백엔드가 로컬 무인증(또는 로컬 password) → **폰 게이트는 CmdPilot 자신의 레이어**(동사 화이트리스트 + PIN). **화이트리스트는 백엔드별로** 정의(각 CLI의 위험 표면이 다름).
 
 ---
 
 ## 4½. 런타임 토폴로지 — cmux 로컬 콕핏 + herdr 원격 런타임
 
-> 결정적 사실(사용자 cmux 심층 가이드): **"session persistence — cmux는 layout만 복구", "live process는 원격 tmux가 담당."**
+> 운영 모델의 결정적 사실: **"session persistence — cmux는 layout만 복구", "live process는 원격 tmux가 담당."**
 
 cmux의 "원격 워크스페이스"는 실은 로컬 pane에서 `ssh host`를 실행하는 것이다. 실제 원격 프로세스는 그 SSH 세션 안에 살고, **맥이 잠들거나 cmux를 끄면 SSH가 끊겨 원격 작업이 죽는다.** cmux는 재시작 시 **레이아웃(=`ssh` 재실행)만** 복구하지 세션 상태를 복구하지 않는다. → **원격 에이전트가 맥 슬립·연결끊김을 견디는 유일한 방법은 원격 서버 위의 멀티플렉서(herdr, 또는 tmux).**
 
@@ -145,7 +145,7 @@ cmux의 "원격 워크스페이스"는 실은 로컬 pane에서 `ssh host`를 �
 | 얕게 | herdr을 cmux pane 안에서 SSH 실행 → **cmux 백엔드**가 그 pane을 미러 | **시각(TUI 렌더)만** |
 | **깊게 ✅** | MacPilot **herdr 백엔드**가 `ssh box herdr agent list --json` 등 **SSH 릴레이** | **구조화 상태 칩 + push** |
 
-깊은 경로가 얕은 경로를 **포함(상위호환)** 하므로 — herdr 백엔드는 로컬 herdr도, cmux-pane-속-herdr도 다 커버 — **herdr 백엔드(SSH 릴레이)를 구현**한다. `ssh ControlMaster/ControlPersist`로 콜드 SSH(150ms~1s)를 완화한다. **전제**: 원격 박스에 herdr 설치(`curl -fsSL https://herdr.dev/install.sh | sh`). 원격 대상·SSH 옵션은 `~/Library/Application Support/MacPilot/herdr.json`으로 설정(하드코딩 없음).
+깊은 경로가 얕은 경로를 **포함(상위호환)** 하므로 — herdr 백엔드는 로컬 herdr도, cmux-pane-속-herdr도 다 커버 — **herdr 백엔드(SSH 릴레이)를 구현**한다. `ssh ControlMaster/ControlPersist`로 콜드 SSH(150ms~1s)를 완화한다. **전제**: 원격 박스에 herdr 설치(`curl -fsSL https://herdr.dev/install.sh | sh`). 원격 대상·SSH 옵션은 `~/Library/Application Support/CmdPilot/herdr.json`으로 설정(하드코딩 없음).
 
 ---
 
@@ -177,7 +177,7 @@ cmux의 "원격 워크스페이스"는 실은 로컬 pane에서 `ssh host`를 �
 - **Orca 중복** — 자사 모바일 앱과 정면 경합. 통합 ROI 낮음.
 - **핸들 stale**(Herdr/Orca) — 폰이 핸들을 오래 쥐면 오타깃. op 전 재획득 또는 짧은 TTL.
 - **⑤의 이질성** — 상태 소스의 급이 백엔드마다 다름(네이티브/제목/합성/플러그인). 폰 UI는 "상태 신뢰도"를 백엔드별로 다르게 표현하거나, 최소공통(idle/active)만 통일 노출하는 결정 필요.
-- **RQ 연결** — 볼트의 `RQ: cmux Socket API는 CLI-agnostic인가`(→ CmdDeck)와 동일 축. 이 브리지가 그 RQ의 실증 구현체가 됨.
+- **연구 질문 연결** — `cmux Socket API는 CLI-agnostic인가`와 동일 축이며, 이 브리지가 실증 구현체가 됨.
 
 ---
 

@@ -8,7 +8,7 @@ PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 APP_BINARY="$HOME/Applications/$APP_NAME.app/Contents/MacOS/$APP_NAME"
 LOG_FILE="$HOME/Library/Logs/CmdPilot/helper.log"
 PORT="$(sed -n 's/.*let port: UInt16 = \([0-9][0-9]*\).*/\1/p' "$ROOT_DIR/MacHelper/Sources/HelperServer.swift" | head -1)"
-PORT="${PORT:-8765}"
+PORT="${PORT:-8766}"
 
 url() {
   local host
@@ -98,7 +98,7 @@ case "${1:-status}" in
     "$ROOT_DIR/deploy.sh"
     ;;
   sync-web)
-    # 웹 파일만 고쳤을 때: 재빌드(=ad-hoc 재서명 → 손쉬운 사용 권한 리셋) 없이 즉시 반영.
+    # 웹 파일만 고쳤을 때: Swift 재빌드·재배포 없이 즉시 반영.
     # 서버는 이 폴더에 파일이 있으면 번들 대신 여기서 서빙한다.
     WEB_OVERRIDE="$HOME/Library/Application Support/CmdPilot/web"
     mkdir -p "$WEB_OVERRIDE"
@@ -106,7 +106,10 @@ case "${1:-status}" in
     echo "동기화 완료 → $WEB_OVERRIDE (폰에서 새로고침하면 반영)"
     ;;
   unsync-web)
-    rm -rf "$HOME/Library/Application Support/CmdPilot/web"
+    WEB_OVERRIDE="$HOME/Library/Application Support/CmdPilot/web"
+    if [ -e "$WEB_OVERRIDE" ]; then
+      find "$WEB_OVERRIDE" -depth -delete
+    fi
     echo "오버라이드 해제 — 번들 웹 리소스로 복귀"
     ;;
   *)

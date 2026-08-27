@@ -15,7 +15,18 @@ xcuserdata/
 .swiftpm/
 .build/
 .release/
+.debug/
 .tt/
+*.xcarchive
+
+# 로컬 서명/TLS 자격증명 — 공개 저장소에 절대 포함하지 않음
+*.p12
+*.pfx
+*.pem
+*.key
+*.crt
+*.cer
+*.mobileprovision
 
 # 미사용(초기 네이티브 iOS 시도 — 현재 웹 클라이언트로 대체됨)
 iOSApp/

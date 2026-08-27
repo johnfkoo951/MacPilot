@@ -2,7 +2,8 @@
 
 > 폰↔Mac 연결 전송을 대안까지 확장 검토. 5개 전략을 병렬 조사 + 적대적 검증(각 전략의 핵심 주장을 회의적으로 재검토).
 > 방법: 서브에이전트 5(조사) + 5(검증), 웹 확인 포함. 아래 판정은 **검증 통과본**이며, 검증이 뒤집은 주장은 `⚠️ 검증 교정`으로 표기.
-> 컨텍스트: 사용자의 터미널 비교표(terminal.cmdspace.work) — tmux·Zellij·Herdr·Cmux·Orca·Warp·Ghostty.
+> 컨텍스트: 터미널 멀티플렉서 비교 — tmux·Zellij·Herdr·Cmux·Orca·Warp·Ghostty.
+> 상태: **과거 설계 연구 스냅샷**. 현재 구현은 same-origin+Host 검증과 PIN epoch 검증을 포함하므로 운영 기준은 `docs/CONNECTION.md`를 따른다.
 
 ---
 
@@ -30,7 +31,7 @@ MacPilot은 **무인증 `CGEvent` 주입기** — LAN 밖으로 노출되는 순
 |---|---|---|---|---|
 | 1 | mDNS `http://<mac>.local:8766` | `ws://` | 같은 LAN | 기본 |
 | 2 | `tailscale serve` → `https://<mac>.<tailnet>.ts.net` | `wss://` | tailnet 멤버 | 원격 + secure context |
-| 3 | 앱 `:443` + Let's Encrypt(`pilot.cmdspace.work`, acme.sh) | `wss://` | tailnet 전용(A레코드=Tailscale IP) | 에어마우스(iOS 모션) 생산 경로 |
+| 3 | 앱 `:443` + 유효 인증서(예: `control.example.com`) | `wss://` | private network 전용 | 에어마우스(iOS 모션) 경로 |
 | (aux) | `:80` 보조 리스너 | `ws://` | 포트 없는 주소용 | 선택 |
 
 - `app.js`는 페이지가 `https:`면 자동으로 `wss`, 아니면 `ws` 선택(코드 변경 없이 전송이 따라옴).
@@ -94,7 +95,7 @@ WireGuard 기반 오버레이(Tailscale) 위로 평문 ws/http를 흘리면:
 ### 4.3 🟡 공개 리버스 터널 (CF Tunnel + Cloudflare Access) — *조건부, ①이 전제*
 
 Mac이 엣지로 아웃바운드 터널을 걸어 공인 인바운드를 되받는 방식(포트포워딩·공인IP 불필요).
-**"폰에 Tailscale 필수" 마찰을 제거** → 아무 셀룰러 브라우저에서 동작. 이미 쓰는 **cmdspace.work Cloudflare 인프라 재사용**.
+**"폰에 Tailscale 필수" 마찰을 제거** → 아무 셀룰러 브라우저에서 동작. 기존의 **검증된 커스텀 도메인 인프라를 재사용**할 수 있다.
 
 - **CF Tunnel(무료·무제한 대역폭)** + **CF Access(≤50명 무료, Email OTP/Google/GitHub OAuth)** = 요청이 `:8766`에 닿기 **전에 엣지에서 선인증**. `CF_Authorization` 쿠키가 same-origin이라 WS 핸드셰이크에도 실림.
 - **제로 의존성 유지**: 웹/Swift 0줄(app.js가 https→wss 자동), cloudflared는 외부 바이너리(tailscale와 동급), Access는 엣지 설정.
@@ -102,7 +103,7 @@ Mac이 엣지로 아웃바운드 터널을 걸어 공인 인바운드를 되받�
 > ⚠️ **검증 교정 3건 (이거 모르면 삽질):**
 > 1. **함정 — CF Access 세션 만료가 wss를 죽인다**: Access는 *최초 내비게이션*만 게이트하지만 조종은 *지속 wss 스트림*에 의존. 세션(기본 24h) 만료 시 살아있던 WebSocket이 조용히 끊기고, 재연결 핸드셰이크는 로그인으로 302되는데 **JS WS 클라이언트는 대화형 OAuth 리다이렉트를 못 따라간다** → 사용 도중 트랙패드가 죽고 페이지 리로드+재인증 강요. "아무 폰이나 집어 바로 조종"을 정면으로 깎는다.
 > 2. **cloudflared는 "무설정"이 아니다**: Tunnel 기본 QUIC 전송이 WS `Upgrade` 헤더를 제거(→400)하는 문서화된 실패모드 → `--protocol http2` 지정 필요. (CDN/프록시 층의 WS 기본 on과 Tunnel 경로는 다름.)
-> 3. **ngrok 배제 근거 정정**: ngrok 무료도 **엣지 OAuth(월 3 MAU)**가 있다. CF를 택할 진짜 이유는 "ngrok에 OAuth가 없어서"가 아니라 (a) **무제한 대역폭**(트랙패드 move-frame 스트림이 ngrok 무료 1GB/월을 넘길 수 있음), (b) **커스텀 도메인 재사용**(cmdspace.work), (c) OAuth 50 vs 3 MAU, (d) 릴레이 지연. **Tailscale Funnel은 배제**(공개 노출·내장 인증 없음·항상 릴레이 지연·README가 금지).
+> 3. **ngrok 배제 근거 정정**: ngrok 무료도 **엣지 OAuth(월 3 MAU)**가 있다. CF를 택할 진짜 이유는 "ngrok에 OAuth가 없어서"가 아니라 (a) **무제한 대역폭**(트랙패드 move-frame 스트림이 ngrok 무료 1GB/월을 넘길 수 있음), (b) **기존 커스텀 도메인 재사용**, (c) OAuth 50 vs 3 MAU, (d) 릴레이 지연. **Tailscale Funnel은 배제**(공개 노출·내장 인증 없음·항상 릴레이 지연·README가 금지).
 
 **하드 전제조건**: ①(인증 하드닝, 최소한 Access 앞단)이 먼저. 맨몸 무인증 서버를 공개 터널에 노출하는 순진한 형태는 **금지**.
 
@@ -137,7 +138,7 @@ Mac이 엣지로 아웃바운드 터널을 걸어 공인 인바운드를 되받�
 
 ## 5. 터미널 비교표 → MacPilot 매핑
 
-사용자의 7개 앱 비교표에서 뽑은 "원격 연결 패턴"을 MacPilot의 두 모델에 대응:
+비교한 7개 앱에서 뽑은 "원격 연결 패턴"을 CmdPilot의 두 모델에 대응:
 
 | 앱 | 원격 방식 | MacPilot 대응 | 이식 가치 |
 |---|---|---|---|

@@ -28,7 +28,7 @@ case "$MODE" in
   --debug|debug)
     cd "$ROOT_DIR"
     xcodegen generate >/dev/null
-    xcodebuild -project CmdPilot.xcodeproj -scheme CmdPilotHelper -configuration Debug -derivedDataPath ./.debug CODE_SIGNING_ALLOWED=NO build
+    "$ROOT_DIR/script/xcodebuild-clean.sh" -project CmdPilot.xcodeproj -scheme CmdPilotHelper -configuration Debug -derivedDataPath ./.debug CODE_SIGNING_ALLOWED=NO build
     lldb -- "$ROOT_DIR/.debug/Build/Products/Debug/$APP_NAME.app/Contents/MacOS/$APP_NAME"
     ;;
   *)

@@ -12,6 +12,13 @@ final class Pairing {
     private var _enabled: Bool
     private var _pin: String
     private var _token: String
+    private var _authorizationEpoch: UInt64 = 1
+    private struct AttemptState {
+        var failures: Int
+        var blockedUntil: Date
+        var lastSeen: Date
+    }
+    private var attemptsByPeer: [String: AttemptState] = [:]
 
     init() {
         let d = UserDefaults.standard
@@ -29,13 +36,21 @@ final class Pairing {
     var pin: String { lock.lock(); defer { lock.unlock() }; return _pin }
 
     func setEnabled(_ on: Bool) {
-        lock.lock(); _enabled = on; lock.unlock()
+        lock.lock()
+        if _enabled != on { _authorizationEpoch &+= 1 }
+        _enabled = on
+        lock.unlock()
         UserDefaults.standard.set(on, forKey: "pairingEnabled")
     }
 
     func regeneratePin() {
         let p = Pairing.generatePin()
-        lock.lock(); _pin = p; _token = Pairing.token(for: p); lock.unlock()
+        lock.lock()
+        _pin = p
+        _token = Pairing.token(for: p)
+        _authorizationEpoch &+= 1
+        attemptsByPeer.removeAll()
+        lock.unlock()
         UserDefaults.standard.set(p, forKey: "pairingPin")
     }
 
@@ -52,9 +67,32 @@ final class Pairing {
     /// 성공한 PIN 입력 후 쿠키에 넣을 토큰
     func currentToken() -> String { lock.lock(); defer { lock.unlock() }; return _token }
 
-    func verifyPin(_ candidate: String?) -> Bool {
-        lock.lock(); let pin = _pin; lock.unlock()
-        return Pairing.constantTimeEqual(candidate, pin)
+    func verifyPin(_ candidate: String?, peer: String) -> Bool {
+        let now = Date()
+        lock.lock()
+        if let attempt = attemptsByPeer[peer], attempt.blockedUntil > now {
+            lock.unlock()
+            return false
+        }
+        let pin = _pin
+        if Pairing.constantTimeEqual(candidate, pin) {
+            attemptsByPeer.removeValue(forKey: peer)
+            lock.unlock()
+            return true
+        }
+        let failures = min((attemptsByPeer[peer]?.failures ?? 0) + 1, 10)
+        let delay = min(30.0, pow(2.0, Double(failures - 1)))
+        attemptsByPeer[peer] = AttemptState(
+            failures: failures,
+            blockedUntil: now.addingTimeInterval(delay),
+            lastSeen: now
+        )
+        if attemptsByPeer.count > 256,
+           let oldest = attemptsByPeer.min(by: { $0.value.lastSeen < $1.value.lastSeen })?.key {
+            attemptsByPeer.removeValue(forKey: oldest)
+        }
+        lock.unlock()
+        return false
     }
 
     /// 요청 인가 여부. **비활성이면 항상 true(개방)** → 하위 호환.
@@ -62,6 +100,21 @@ final class Pairing {
         lock.lock(); let on = _enabled; let tok = _token; lock.unlock()
         if !on { return true }
         return Pairing.constantTimeEqual(cookieToken, tok)
+    }
+
+    /// WS 업그레이드 시 유효한 쿠키에 현재 epoch를 부여한다. PIN 전환·재생성은 epoch를
+    /// 즉시 바꾸므로 closeAllConnections가 큐에서 실행되기 전에도 이전 연결은 폐기된다.
+    func authorizedEpoch(cookieToken: String?) -> UInt64? {
+        lock.lock()
+        let on = _enabled, tok = _token, epoch = _authorizationEpoch
+        lock.unlock()
+        guard on, Pairing.constantTimeEqual(cookieToken, tok) else { return nil }
+        return epoch
+    }
+
+    func isCurrentAuthorization(epoch: UInt64?) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _enabled && epoch == _authorizationEpoch
     }
 
     static func readCookie(_ header: String?, name: String) -> String? {

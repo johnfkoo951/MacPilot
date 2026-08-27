@@ -3,6 +3,7 @@ import ApplicationServices
 import Darwin
 import Foundation
 import Network
+import Security
 
 /// 로컬 웹서버(HTTP + WebSocket). 아이폰 사파리가 접속하면 트랙패드 UI를 내려주고,
 /// WebSocket 으로 받은 명령을 `EventInjector` 로 넘긴다.
@@ -22,7 +23,7 @@ final class HelperServer: ObservableObject {
     @Published var pairingEnabled = false
     @Published var pairingPin = ""
 
-    let port: UInt16 = 8766   // 8765 는 OmniControl bridge 가 사용 중이라 변경
+    let port: UInt16 = 8766
     let launchAgentLabel = "com.cmdspace.cmdpilot.helper"
 
     private var listener: NWListener?
@@ -60,7 +61,7 @@ final class HelperServer: ObservableObject {
     func setPairing(_ on: Bool) {
         pairing.setEnabled(on)
         pairingEnabled = on
-        if on { closeAllConnections() }   // 켜는 순간 기존 연결을 끊어 재페어링 강제
+        closeAllConnections()   // 모든 전환에서 기존 쿠키/세션을 즉시 재검증
     }
 
     func regeneratePairingPin() {
@@ -72,7 +73,14 @@ final class HelperServer: ObservableObject {
     private func closeAllConnections() {
         serverQueue.async { [weak self] in
             guard let self else { return }
-            for c in self.connections.values { c.forceClose() }
+            let clients = Array(self.connections.values)
+            for c in clients {
+                c.sendText("{\"t\":\"security\",\"required\":\"reload\"}")
+            }
+            // epoch는 이미 폐기됐으므로 이 짧은 유예 중 명령은 거절된다. 안내 프레임만 전달한다.
+            self.serverQueue.asyncAfter(deadline: .now() + 0.15) {
+                for c in clients { c.forceClose() }
+            }
         }
     }
 
@@ -160,43 +168,75 @@ final class HelperServer: ObservableObject {
             .appendingPathComponent("CmdPilot/tls/pilot.p12")
         guard let data = try? Data(contentsOf: p12URL) else { return nil }
 
-        var items: CFArray?
-        let options = [kSecImportExportPassphrase as String: "macpilot"] as CFDictionary
-        let status = SecPKCS12Import(data as CFData, options, &items)
-
-        var identity: SecIdentity?
-        if status == errSecSuccess,
-           let first = (items as? [[String: Any]])?.first,
-           let raw = first[kSecImportItemIdentity as String] {
-            identity = (raw as! SecIdentity)
-        } else if status == errSecDuplicateItem {
-            // 이미 키체인에 들어간 경우 → 라벨로 조회
-            let query: [String: Any] = [
-                kSecClass as String: kSecClassIdentity,
-                kSecAttrLabel as String: "pilot.cmdspace.work",
-                kSecReturnRef as String: true,
-            ]
-            var result: CFTypeRef?
-            if SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess {
-                identity = (result as! SecIdentity)
-            }
+        guard #available(macOS 15.0, *) else {
+            tlsLog("내장 p12 HTTPS는 macOS 15 이상에서만 지원 — tailscale serve 사용 권장")
+            return nil
         }
-        guard let identity, let secIdentity = sec_identity_create(identity) else { return nil }
+
+        // 메모리 전용 임포트 — 키체인을 안 거치므로 중복(errSecDuplicateItem)도, 개인키
+        // ACL 프롬프트로 핸드셰이크가 침묵하는 문제도 없다. p12는 fullchain으로 만들어져
+        // 있어(make-p12.sh) kSecImportItemCertChain에 리프+중간CA 전부가 들어온다.
+        // iOS는 중간CA 미서빙 시 TLS를 즉시 실패시킨다 (데스크톱은 AIA로 관대) — 체인 필수.
+        guard let passphrase = KeychainSecret.read(
+            service: "com.cmdspace.cmdpilot.tls",
+            account: "pkcs12"
+        ) else {
+            tlsLog("Keychain에 p12 암호가 없어 HTTPS 비활성")
+            return nil
+        }
+
+        var items: CFArray?
+        let optDict: [String: Any] = [
+            kSecImportExportPassphrase as String: passphrase,
+            kSecImportToMemoryOnly as String: true
+        ]
+        let status = SecPKCS12Import(data as CFData, optDict as CFDictionary, &items)
+        guard status == errSecSuccess,
+              let first = (items as? [[String: Any]])?.first,
+              let raw = first[kSecImportItemIdentity as String] else {
+            tlsLog("p12 임포트 실패 status=\(status)"); return nil
+        }
+        let identity = raw as! SecIdentity
+        let chain = (first[kSecImportItemCertChain as String] as? [SecCertificate]) ?? []
+        tlsLog("identity ok (메모리 전용), 체인 \(chain.count)장")
+        let secIdentity: sec_identity_t?
+        if chain.count > 1 {
+            secIdentity = sec_identity_create_with_certificates(identity, chain as CFArray)
+        } else {
+            secIdentity = sec_identity_create(identity)
+        }
+        guard let secIdentity else { tlsLog("sec_identity 생성 실패"); return nil }
 
         let tls = NWProtocolTLS.Options()
         sec_protocol_options_set_local_identity(tls.securityProtocolOptions, secIdentity)
         return tls
     }
 
+    /// TLS 셋업 진단 로그 (/tmp/cmdpilot-tls.log) — 443이 침묵할 때 원인 추적용.
+    static func tlsLog(_ message: String) {
+        let line = "[\(Date())] \(message)\n"
+        if let h = FileHandle(forWritingAtPath: "/tmp/cmdpilot-tls.log") {
+            h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close()
+        } else {
+            try? line.write(toFile: "/tmp/cmdpilot-tls.log", atomically: true, encoding: .utf8)
+        }
+    }
+
     private func accept(_ connection: NWConnection) {
-        let client = HTTPWebSocketConnection(connection: connection, pairing: pairing)
+        let client = HTTPWebSocketConnection(connection: connection, pairing: pairing,
+                                             allowedHosts: NetworkInfo.webSocketAllowedHosts())
         let key = ObjectIdentifier(client)
 
         client.onCommand = { [weak self, weak client] command in
             self?.handleCommand(command, client: client)
         }
-        client.onUpgrade = { [weak self] in
-            guard let self else { return }
+        client.onUpgrade = { [weak self, weak client] in
+            guard let self, let client else { return }
+            if client.isAuthorizedForSensitiveIntegration() {
+                client.sendText("{\"t\":\"security\",\"core\":\"authorized\",\"pairing\":\"authorized\"}")
+            } else if !self.pairing.enabled {
+                client.sendText("{\"t\":\"security\",\"core\":\"authorized\",\"pairing\":\"disabled\"}")
+            }
             self.serverQueue.async { [weak self] in
                 guard let self else { return }
                 self.upgradedKeys.insert(key)
@@ -231,6 +271,10 @@ final class HelperServer: ObservableObject {
 
     /// WebSocket 으로 들어온 명령 처리. move/scroll(고빈도)은 메인 UI 갱신을 건너뛰고 주입만 한다.
     private func handleCommand(_ command: InboundCommand, client: HTTPWebSocketConnection?) {
+        if pairing.enabled, client?.isAuthorizedForSensitiveIntegration() != true {
+            client?.sendText("{\"t\":\"security\",\"required\":\"pairing\"}")
+            return
+        }
         switch command.t {
         case "ping":
             let payload: [String: Any] = [
@@ -261,17 +305,84 @@ final class HelperServer: ObservableObject {
             }
             return
         case "cmux":
+            guard sensitiveIntegrationAllowed(client) else { return }
             // 멀티플렉서 원격 전환 (backend=cmux 기본 / herdr …). 각 백엔드가 동사 화이트리스트 검증.
             guard let backend = BridgeRouter.backend(command.backend) else {
                 client?.sendText(BridgeRouter.unavailableState(command.backend)); return
             }
-            backend.handle(command) { [weak client] json in client?.sendText(json) }
+            backend.handle(command) { [weak client] json in
+                guard client?.isAuthorizedForSensitiveIntegration() == true else { return }
+                client?.sendText(json)
+            }
+            return
+        case "omni":
+            guard sensitiveIntegrationAllowed(client) else { return }
+            // 선택적 로컬 에이전트 서비스 상태 — 토큰은 헬퍼가 주입
+            OmniBridge.state { [weak client] json in
+                guard client?.isAuthorizedForSensitiveIntegration() == true else { return }
+                client?.sendText(json)
+            }
+            return
+        case "omniSearch":
+            guard sensitiveIntegrationAllowed(client) else { return }
+            // 세션 코퍼스 검색/브라우즈: text=질의, dir=browse 모드, name=cwd
+            OmniBridge.search(q: command.text ?? "", browse: command.dir ?? "",
+                              cwd: command.name ?? "", requestID: command.id) {
+                [weak client] json in
+                guard client?.isAuthorizedForSensitiveIntegration() == true else { return }
+                client?.sendText(json)
+            }
+            return
+        case "omniFocus":
+            guard sensitiveIntegrationAllowed(client) else { return }
+            // 검색 히트 열기/부활: target=session_id, name=cwd
+            OmniBridge.focusSession(session: command.target ?? "",
+                                    cwd: command.name ?? "") {
+                [weak client] json in
+                guard client?.isAuthorizedForSensitiveIntegration() == true else { return }
+                client?.sendText(json)
+            }
+            return
+        case "omniPtt":
+            guard sensitiveIntegrationAllowed(client) else { return }
+            // PTT 확인 카드 원격 결정: dir = send|cancel|hold, target = 세션 ref(선택)
+            OmniBridge.ptt(action: command.dir ?? "", ref: command.target ?? "",
+                           requestID: command.id) {
+                [weak client] json in
+                guard client?.isAuthorizedForSensitiveIntegration() == true else { return }
+                client?.sendText(json)
+            }
+            return
+        case "csess":
+            guard sensitiveIntegrationAllowed(client) else { return }
+            // 세션별 원격 — 포커스 안 뺏는 read/send/key (cmux 전용, UUID+화이트리스트 검증)
+            let scope = command.name ?? "workspace"
+            let id = command.target ?? ""
+            switch command.action {
+            case "read":
+                CmuxBridge.readTarget(scope: scope, id: id, lines: command.count ?? 60) {
+                    [weak client] json in
+                    guard client?.isAuthorizedForSensitiveIntegration() == true else { return }
+                    client?.sendText(json)
+                }
+            case "send":
+                CmuxBridge.sendTarget(scope: scope, id: id, text: command.text ?? "",
+                                      submit: command.submit ?? true)
+            case "key":
+                CmuxBridge.sendKeyTarget(scope: scope, id: id, key: command.text ?? "")
+            default: break
+            }
             return
         case "cterm":
+            guard sensitiveIntegrationAllowed(client) else { return }
             // 멀티플렉서 터미널 뷰 (포커스/지정 pane 화면 텍스트 + 입력)
             guard let backend = BridgeRouter.backend(command.backend) else { return }
             switch command.action {
-            case "grid":  backend.terminalGrid(handle: command.handle) { [weak client] json in client?.sendText(json) }
+            case "grid":
+                backend.terminalGrid(handle: command.handle) { [weak client] json in
+                    guard client?.isAuthorizedForSensitiveIntegration() == true else { return }
+                    client?.sendText(json)
+                }
             case "input": backend.terminalInput(handle: command.handle, text: command.text ?? "")
             default: break
             }
@@ -335,6 +446,15 @@ final class HelperServer: ObservableObject {
         EventInjector.perform(command)
     }
 
+    /// 세션 내용 조회·원격 결정 같은 통합 기능은 PIN 페어링을 명시적으로 켠 경우만 허용한다.
+    private func sensitiveIntegrationAllowed(_ client: HTTPWebSocketConnection?) -> Bool {
+        guard pairing.enabled, client?.isAuthorizedForSensitiveIntegration() == true else {
+            client?.sendText("{\"t\":\"security\",\"required\":\"pairing\"}")
+            return false
+        }
+        return true
+    }
+
     private func updateURL() {
         // .local 고정 주소 우선 (IP가 바뀌어도 안 변함)
         if let host = NetworkInfo.localHostName() {
@@ -351,7 +471,7 @@ final class HelperServer: ObservableObject {
             ipFallback = ""
         }
         // HTTPS 주소 (에어마우스/모션 = secure context 필수). 서브프로세스라 백그라운드에서.
-        // 우선순위: 앱이 :443에서 서빙하는 인증서 CN(예: pilot.cmdspace.work) → tailscale serve.
+        // 우선순위: 앱이 :443에서 서빙하는 인증서 CN → tailscale serve.
         let has443 = (listener443 != nil)
         DispatchQueue.global(qos: .utility).async { [weak self] in
             var https = ""

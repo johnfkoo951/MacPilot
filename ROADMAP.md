@@ -11,9 +11,9 @@
 ## 이번 세션 완료 로그 (2026-07-07)
 
 - **에어마우스 살림** 🟢 — iOS 모션 센서 HTTPS 요건 해결. `tailscale serve`로 확인 후, **앱 :443 + LE 인증서
-  (pilot.cmdspace.work) + DNS→Tailscale IP** 조합으로 확정. 권한 요청을 `pointerdown`→`click`으로 분리(iOS 팝업),
+  (예: `control.example.com`) + private DNS** 조합으로 확정. 권한 요청을 `pointerdown`→`click`으로 분리(iOS 팝업),
   안내를 iOS 17+ 실제 모델로 정정. 커밋 `24de9aa`, `d825d0e`.
-- **pilot.cmdspace.work 무포트 HTTPS** 🟢 — tailnet 전용(안전) + 유효 인증서 + wss. 메뉴바에 주소 광고.
+- **커스텀 도메인 무포트 HTTPS** 🟢 — private network 전용 + 유효 인증서 + wss. 메뉴바에 주소 광고.
 - **에어마우스 방향 90° 교정** 🟢 — `rotationRate.alpha`(롤)→`gamma`(yaw) + 화면방향 보정.
 - **미러 핀치줌/팬 + 3·4핑거 제스처(트랙패드 공유)** 🟢 — 워크플로우 설계+적대검증. 커밋 `38958bc`.
 - **3·4핑거 오발화 수정** 🟢 — 손가락 추가마다 기준 재설정 + 정착창. 커밋 `1d134ea`.
@@ -33,8 +33,8 @@
 | 미러(화면 보기)+핀치줌·팬 | 🟢 | MJPEG 경량, 오디오·코덱 없음 |
 | cmux 터미널 뷰 | 🟢 | 동작 |
 | 3·4핑거 제스처 인식 | 🟡 | 인식은 됨, 사용성 보통 |
-| **에어마우스(모션)** | 🟢 | **해결 — pilot.cmdspace.work(HTTPS)에서 동작 + 방향축(gamma) 교정** |
-| **pilot.cmdspace.work** | 🟢 | **앱 :443 + LE 인증서 · DNS→Tailscale IP(tailnet 전용) · 무포트 HTTPS** |
+| **에어마우스(모션)** | 🟢 | **해결 — private HTTPS에서 동작 + 방향축(gamma) 교정** |
+| **커스텀 HTTPS** | 🟢 | **앱 :443 + 유효 인증서 · private DNS · 무포트 HTTPS** |
 | **데스크탑(공간) 전환** | 🔴 | **macOS 26이 합성 전환 차단** |
 | iPad 도킹 분할 | 🟡 | 코어는 OK, 스플리터 오프셋·터치타깃 버그 |
 | 화면기록 권한 안내 | 🟡 | 인앱 UI 없음(손쉬운사용만 폴링) |
@@ -45,8 +45,8 @@
 ## 1. 지금 안 되는 것 (우선 수정)
 
 ### 1.1 🟢 에어마우스(모션 센서) — 해결됨 (2026-07-07)
-> **완료**: `https://pilot.cmdspace.work`에서 동작 확인. 아래는 해결 경위(기록용).
-> - HTTPS: 앱 `:443` 리스너가 LE 인증서(CN=pilot.cmdspace.work)로 서빙. DNS는 Tailscale IP(tailnet 전용=안전).
+> **완료**: private HTTPS 주소에서 동작 확인. 아래는 해결 경위(기록용).
+> - HTTPS: 앱 `:443` 리스너가 유효 인증서로 서빙. DNS는 private network 안에서만 Mac을 가리킨다.
 > - 권한: iOS 17+는 설정 메뉴 없이 '팝업'만 → 요청을 `pointerdown`→`click`(iOS가 인정하는 제스처)으로 분리.
 > - 방향: `onAirMotion`이 `alpha`(롤) 대신 `gamma`(yaw)를 수평에 쓰도록 교정(90° 어긋남 해소) + 화면방향 보정.
 
@@ -59,13 +59,13 @@
   `airStart()`가 즉시 차단(app.js). **모션→커서 코드(rotationRate + orientation 폴백 + 1€ 필터)와 권한 요청
   흐름(requestPermission)은 이미 올바르게 구현돼 있고, 오직 HTTP 오리진 때문에 도달을 못 할 뿐이다.**
 - **이미 있는 것**: `HelperServer`에 조건부 `:443` TLS 리스너(`listener443`)가 존재
-  (`App Support/MacPilot/tls/pilot.p12`, 패스프레이즈 `macpilot`, CN=pilot.cmdspace.work). 하지만 `updateURL()`이
+  (`App Support/CmdPilot/tls/pilot.p12`, 암호는 macOS Keychain, CN은 배포별 도메인). 하지만 `updateURL()`이
   **무조건 http URL만** 만들어 메뉴/QR에 노출 → 인증서를 깔아도 http QR이 나와 에어마우스가 죽음.
 - **해결안(택1)**:
   1. **(권장) `tailscale serve`** 로 로컬 서버 앞단에 Tailscale 발급 TLS를 붙여 `https://<mac>.<tailnet>.ts.net`
      제공 → 유효 secure context + wss 자동 승격(app.js는 https면 wss 선택). 그 https URL을 메뉴/QR에 광고.
      인증서·DNS 부담 없음.
-  2. 기존 `:443` p12 경로 완성 — `listener443 != nil`이면 `httpURL`을 `https://pilot.cmdspace.work`로 바꿔 광고
+  2. 기존 `:443` p12 경로 완성 — `listener443 != nil`이면 인증서 CN의 HTTPS 주소를 광고
      (`.local`은 LE 인증서 CN과 불일치하니 도메인 사용). DNS가 폰에서 맥으로 해석돼야 함.
   3. 스톱갭: `<name>.local`용 자체서명/mkcert 인증서 + 폰에 신뢰 설치 안내.
 - **부수 작업**: 안내문을 "보안 컨텍스트(HTTPS)로 접속" 우선으로 재정렬(iOS 26/27은 사이트별 권한 거부가 아니라
@@ -138,7 +138,7 @@
 - **로그 로테이션** 🟢 — `/tmp` 진단 로그가 무제한 append. 로테이션/비활성 옵션.
 - **카메라 OCR** 🟢 — 실시간 카메라 아니라 파일 피커 1장. 빈 결과 무피드백 → 명시 메시지, (향후) 연속 스캔 모드.
 - **활성 포트 표기** 🟢 — :80/:443이 실패해도 조용히 스킵, 메뉴엔 8766만. 실제 활성 포트 표기.
-- **p12 패스프레이즈 하드코딩('macpilot')** — 외부화 검토.
+- **p12 암호 외부화** 🟢 — 소스에서 제거하고 macOS Keychain 조회로 전환.
 
 ---
 
@@ -183,7 +183,7 @@
 4. 죽은 코드 정리 (3) — S
 
 **다음(핵심 가치)**
-5. **에어마우스 HTTPS 해결** — `tailscale serve` 경로 (1.1) — M ★ 사용자 오래 원한 기능
+5. **에어마우스 HTTPS 해결** — `tailscale serve` 경로 (1.1) — M ★ 사용성 가치 높은 기능
 6. 발표 스팟라이트 완성 (1.5) — S
 7. 제스처 취소(fire-on-release) 옵션 — S
 

@@ -1,94 +1,100 @@
 # AGENTS.md
 
-This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
+This file is the canonical guidance for coding agents working in this repository.
 
-## What this is
+## Project
 
-MacPilot turns a Mac into a wireless trackpad / keyboard / Stream-Deck controlled from any phone's
-browser. A menu-bar Swift helper runs a hand-rolled HTTP + WebSocket server on the LAN (port 8765);
-the phone opens a URL, gets a vanilla HTML/JS web client, and its gestures/taps are streamed back as
-JSON commands that the Mac injects as real input via Quartz Event Services (`CGEvent`). No phone app,
-no Swift frameworks beyond the SDK, no JS dependencies. LAN-only, unauthenticated.
+CmdPilot turns a Mac into a browser-controlled trackpad, keyboard, deck, screen viewer, and optional
+AI-agent remote. A Swift menu-bar helper serves a dependency-free HTML/JS client over HTTP and
+WebSocket, then injects validated commands through Quartz Event Services.
 
-The project is XcodeGen-defined (no checked-in `.xcodeproj`) and codebase comments are in Korean.
+- macOS helper: Swift, `LSUIElement`, Network.framework, Quartz/AppKit/Security
+- phone/tablet client: vanilla HTML/CSS/JS, no build step
+- project definition: XcodeGen `project.yml`; generated `.xcodeproj` is ignored
+- default application port: `8766`; optional listeners on `80` and `443`
+- bundle identifier: `com.cmdspace.cmdpilot.helper`
+- LaunchAgent label: `com.cmdspace.cmdpilot.helper`
 
-## Build, run, deploy
+Comments and user-facing strings are predominantly Korean; match the surrounding file.
+
+## Build, run, and validate
+
+Run commands from the repository root.
 
 ```bash
-xcodegen generate            # regenerate MacPilot.xcodeproj from project.yml — run after ANY file add/remove
-open MacPilot.xcodeproj       # then build/run target MacPilotHelper in Xcode (📡 menu-bar icon appears)
+xcodegen generate
+open CmdPilot.xcodeproj
 
-./deploy.sh                  # Release build → ~/Applications/MacPilot Helper.app → restart launchd agent
+# Repeatable command-line build without signing or installation
+./script/xcodebuild-clean.sh -project CmdPilot.xcodeproj -scheme CmdPilotHelper -configuration Release \
+  -derivedDataPath ./.release CODE_SIGNING_ALLOWED=NO build
+
+# Normal local deployment: build, sign, install, and restart the LaunchAgent
+./deploy.sh
 ```
 
-- There is no test suite and no linter. All commands must run from the repo root
-  (`xcodegen generate` looks for `project.yml` in cwd).
-- `deploy.sh` is the normal dev loop once set up: it does NOT open Xcode — it builds Release,
-  signs with the keychain's *Apple Development* cert if one exists (stable identity keeps the
-  Accessibility grant across rebuilds), otherwise falls back to **ad-hoc signing** (works, but
-  Accessibility must be re-granted after every rebuild). It installs to `~/Applications`,
-  **auto-creates the LaunchAgent plist if missing**, and (re)starts the always-on agent.
-  See `SERVER.md` for launchd management commands.
-- **Do not run the app from Xcode while the launchd server is running** — both bind port 8765 and collide.
-- Adding/removing a source or web file means editing what `project.yml` globs (`MacHelper/Sources`,
-  `MacHelper/Web`) then re-running `xcodegen generate`.
+- Run `xcodegen generate` after adding or removing any source or web resource.
+- There is no macOS unit-test suite or linter. A clean Release build is the minimum verification.
+- Windows helper tests live under `WindowsHelper/` and are independent of the macOS target.
+- Do not run from Xcode while the installed LaunchAgent is active; both instances bind the same ports.
 
-## Two runtime requirements that bite
+## Runtime requirements
 
-- **Accessibility permission** (System Settings → Privacy & Security → Accessibility). Without it
-  `CGEvent` injection silently no-ops. `HelperServer` polls grant status every 1.5s. Ad-hoc re-signing
-  resets this grant, which is why `deploy.sh` re-signs with a stable identity.
-- **Same Wi-Fi + Mac awake.** The server sleeps when the Mac sleeps. The advertised URL uses the mDNS
-  `.local` name (`scutil --get LocalHostName`) so it survives IP changes, falling back to raw IPv4.
+- Accessibility permission is required for `CGEvent` input injection.
+- Screen Recording permission is separately required for capture and mirror features.
+- The Mac must be awake and reachable over the same LAN or a private tailnet.
+- Web-only changes can be copied to the local override with `./script/macpilotctl.sh sync-web`; Swift
+  changes require a rebuild and deployment.
+
+## Security and private configuration
+
+CmdPilot can inject keyboard and pointer input. Keep it on a trusted LAN or private tailnet, never
+port-forward it, and never enable a public Funnel/tunnel without a separate authentication layer.
+Enable PIN pairing before using sensitive local integrations or an untrusted network.
+
+- Browser WebSocket upgrades must remain same-origin and restricted to locally advertised hosts or a
+  same-origin Tailscale-owned `*.ts.net` host.
+- Optional session/search integration commands require PIN pairing.
+- Certificates, private keys, tokens, personal vault names, hostnames, IPs, and production domains must
+  not be committed. Use placeholders in examples.
+- TLS PKCS#12 passwords and optional integration tokens live in macOS Keychain. Configure them with
+  `./script/configure-secrets.sh`; local endpoint metadata lives in
+  `~/Library/Application Support/CmdPilot/integrations.plist`.
+- The cmux socket password is generated and stored by the helper in macOS Keychain; a legacy
+  `cmux-socket.pass` is migrated and removed automatically.
+- Deployment requires a stable signing identity by default because Accessibility and Keychain ACLs
+  must survive rebuilds. Ad-hoc signing is an explicit degraded-mode opt-in only.
+- TLS assets live under `~/Library/Application Support/CmdPilot/tls/` and are ignored by Git.
+- Built-in PKCS#12 HTTPS requires macOS 15+ for memory-only import; use private Tailscale Serve on
+  macOS 13–14.
 
 ## Architecture
 
-Two halves talk over one WebSocket carrying flat JSON commands.
+### Mac side — `MacHelper/Sources/`
 
-### Mac side — `MacHelper/Sources/` (Swift, menu-bar `LSUIElement` app)
+- `HelperServer.swift`: listeners, connection registry, command routing, diagnostics, PIN state
+- `HTTPWebSocketConnection.swift`: HTTP serving, pairing gate, same-origin WebSocket handshake, frames
+- `InboundCommand.swift`: flat JSON wire contract; keep emitted `app.js` commands in lockstep
+- `EventInjector.swift`: serialized `CGEvent` synthesis and drag-state ownership
+- `DeckStore.swift`: shared deck at `~/Library/Application Support/CmdPilot/deck.json`
+- `CmuxBridge.swift`: allowlisted multiplexer state/read/send operations
+- `OmniBridge.swift`: optional loopback-only service bridge; endpoint in local config, token in Keychain
+- `CaptureService.swift` / `ScreenStreamer.swift`: screen capture, OCR, and mirror pipeline
+- `MenuContentView.swift` / `CmdPilotHelperApp.swift`: menu-bar UI and lifecycle
 
-- **`HelperServer.swift`** — `NWListener` on :8765. Accepts connections, routes each decoded
-  `InboundCommand`. Three command types are handled here, not injected: `getDeck`/`saveDeck` (deck
-  sync via `DeckStore`) and `getApps` (`AppList`). Everything else is logged and forwarded to
-  `EventInjector`. Publishes `@Published` diagnostics (client count, command count, last command,
-  accessibility state) consumed by the menu UI.
-- **`HTTPWebSocketConnection.swift`** — hand-rolled HTTP/1.1 + WebSocket (handshake, frame parse/build)
-  over a raw `NWConnection`. Serves the bundled web client on plain HTTP GET, upgrades on `Upgrade:`.
-  No networking framework beyond `Network`.
-- **`EventInjector.swift`** — the only place that synthesizes input. All events run on a single serial
-  `DispatchQueue` so drag state (`isMouseDown`/`downButton`) and event ordering stay consistent.
-  Dispatches on `command.t`: `move`/`down`/`up`/`click`/`scroll`/`key`/`text`/`macro`/`launch`/
-  `gesture`/`zoom`/`volume`/`brightness`. `releaseAll()` is called on socket close so a button never
-  stays stuck down after a dropped connection.
-- **`InboundCommand.swift`** — the wire contract. One flat `Decodable` struct (all optional fields) plus
-  `MacroStep`. This is the source of truth for the JS↔Swift protocol; keep `app.js`'s emitted JSON and
-  this struct in lockstep.
-- **`DeckStore.swift`** — persists the deck JSON verbatim to
-  `~/Library/Application Support/MacPilot/deck.json`. The Mac is the single store, so all phones/tablets
-  share one deck.
-- **`AppList.swift`** — scans installed apps (path + name + icon) for the deck's launch-action picker;
-  icons rendered on the main thread, cached after first build.
-- **`MediaKeys.swift` / `SpaceSwitcher.swift`** — system HID media keys (volume/brightness) and
-  three-finger-swipe → Mission Control / space switching.
-- **`MenuContentView.swift` / `MacPilotHelperApp.swift` / `NetworkInfo.swift`** — SwiftUI menu-bar UI
-  (URL, QR, permission prompt, diagnostics), app entry, and `.local`/IPv4 resolution.
+### Browser side — `MacHelper/Web/`
 
-### Phone side — `MacHelper/Web/` (vanilla, bundled as app resources)
-
-`index.html` + `style.css` + `app.js` (~850 lines, no framework/build step). Captures touch
-gestures and deck interactions, opens the WebSocket, and emits the flat JSON commands that
-`InboundCommand` decodes. Edited as plain files — they ship as bundle resources via `project.yml`'s
-`buildPhase: resources`, so a rebuild/redeploy is needed for changes to reach a phone.
+`index.html`, `style.css`, and `app.js` capture gestures, render the deck/agent/mirror panels, and emit
+the flat JSON protocol. They are bundled as resources and can also be served from the local web
+override. Device-specific preferences, including optional Obsidian vault names, belong in browser
+`localStorage`, never in tracked source.
 
 ## Conventions
 
-- The port is the `port` constant in `HelperServer.swift`. **On this machine it is 8766** —
-  8765 is permanently taken by the OmniControl bridge (`~/DEV/OmniControl/bridge/server.py`).
-  `deploy.sh` auto-detects the constant for its final URL echo.
-- Deck personalization lives server-side in `~/Library/Application Support/MacPilot/deck.json`;
-  on connect the phone adopts the server deck whenever it has `folders` (server wins over the
-  phone's localStorage cache), so seeding/editing that file is how you preconfigure devices.
-- Comments and user-facing strings are predominantly **Korean**; match that when editing existing files.
-- Bundle id prefix `com.joonlab.macpilot`; helper id `com.joonlab.macpilot.helper` (also the launchd label).
-- Version lives in `project.yml` (`MARKETING_VERSION`), not Info.plist.
-- Keep the **zero-dependency** posture on both sides (no SwiftPM packages, no JS libraries).
+- Keep the zero-dependency posture: no SwiftPM packages and no JavaScript libraries.
+- Preserve compatibility identifiers such as `macpilot.settings.v2`, `macpilot://spotlight`, and the
+  `macpilotctl.sh` filename unless a migration is included.
+- Version is defined by `MARKETING_VERSION` in `project.yml`; `Info.plist` references build settings.
+- Treat `InboundCommand.swift` as the protocol source of truth.
+- Preserve unrelated user changes and do not force-push, rewrite published history, or remove local
+  data without explicit approval.

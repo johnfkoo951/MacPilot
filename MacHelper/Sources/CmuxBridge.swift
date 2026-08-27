@@ -2,8 +2,8 @@ import Foundation
 
 /// cmux CLI/RPC 브리지 — 폰(에이전트 탭)에서 cmux 창/워크스페이스/탭을 직접 전환한다.
 ///
-/// ⚠️ 보안: 이 서버는 LAN 무인증이므로 임의 명령 실행은 절대 금지.
-///   - 동사 화이트리스트(state / select-workspace / focus-window / focus-tab)만 처리
+/// ⚠️ 보안: 이 통합은 PIN 페어링 뒤에서만 열리며 임의 명령 실행은 절대 금지.
+///   - 동사 화이트리스트(state / select-workspace / focus-window / focus-tab / open-notif)만 처리
 ///   - 대상 인자는 UUID 형식만 통과, 셸 미경유(Process 인자 배열 직접 전달)
 enum CmuxBridge {
     private static let cliPath = "/Applications/cmux.app/Contents/Resources/bin/cmux"
@@ -20,22 +20,33 @@ enum CmuxBridge {
     // cmux 소켓은 기본 cmuxOnly(자식 프로세스만 허용)라 외부인 이 헬퍼는 password 모드로 인증해야 한다.
     // 문제: cmux 는 재시작할 때 cmux.json 의 socketPassword 를 파일에서 지우고 키체인으로 옮겨버려
     //       "password 모드 + 파일에 패스워드 없음" 상태가 되고, 외부 프로세스인 우리는 인증 불가가 된다.
-    // 해법: 우리 소유의 고정 패스워드를 App Support 에 보관하고, cmux.json 이 그 값과 다르면 다시 써넣는다.
+    // 해법: 우리 소유의 고정 패스워드를 Keychain에 보관하고, cmux.json 이 그 값과 다르면 다시 써넣는다.
     //       cmux 가 파일을 핫리로드하므로 앱 재시작 없이 즉시 복구된다. (auth 실패 시 자동 발동)
 
-    /// 우리가 관리하는 고정 소켓 패스워드 (App Support/CmdPilot/cmux-socket.pass). 없으면 생성.
-    private static func canonicalPassword() -> String {
+    /// 우리가 관리하는 고정 소켓 패스워드. Keychain에 없으면 생성하며, 구버전의 평문 파일은
+    /// 성공적으로 이전한 뒤 삭제한다.
+    private static func canonicalPassword() -> String? {
+        let service = "com.cmdspace.cmdpilot.cmux"
+        let account = "socket"
+        if let existing = KeychainSecret.read(service: service, account: account) { return existing }
+
         let dir = FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("CmdPilot", isDirectory: true)
         let url = dir.appendingPathComponent("cmux-socket.pass")
         if let existing = try? String(contentsOf: url, encoding: .utf8) {
             let trimmed = existing.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty { return trimmed }
+            if !trimmed.isEmpty,
+               KeychainSecret.write(trimmed, service: service, account: account) {
+                try? FileManager.default.removeItem(at: url)
+                return trimmed
+            }
         }
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let pass = (UUID().uuidString + UUID().uuidString).replacingOccurrences(of: "-", with: "").lowercased()
-        try? pass.write(to: url, atomically: true, encoding: .utf8)
+        guard KeychainSecret.write(pass, service: service, account: account) else {
+            debugLog("canonicalPassword: Keychain 저장 실패")
+            return nil
+        }
         return pass
     }
 
@@ -44,7 +55,7 @@ enum CmuxBridge {
     @discardableResult
     static func ensureConfigured() -> Bool {
         guard available else { return false }
-        let pass = canonicalPassword()
+        guard let pass = canonicalPassword() else { return false }
         let text = (try? String(contentsOfFile: cmuxConfigPath, encoding: .utf8))
             ?? "{\n  \"schemaVersion\" : 1\n}\n"
 
@@ -62,6 +73,8 @@ enum CmuxBridge {
             if let out = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]),
                let outStr = String(data: out, encoding: .utf8) {
                 try? outStr.write(toFile: cmuxConfigPath, atomically: true, encoding: .utf8)
+                try? FileManager.default.setAttributes([.posixPermissions: 0o600],
+                                                       ofItemAtPath: cmuxConfigPath)
                 debugLog("ensureConfigured: clean-JSON 재작성")
                 return true
             }
@@ -89,6 +102,8 @@ enum CmuxBridge {
             }
         }
         try? t.write(toFile: cmuxConfigPath, atomically: true, encoding: .utf8)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600],
+                                               ofItemAtPath: cmuxConfigPath)
         debugLog("ensureConfigured: JSONC 정규식 삽입")
         return true
     }
@@ -112,11 +127,59 @@ enum CmuxBridge {
                 _ = run(["rpc", "window.focus", jsonArg(["window_id": target])])
             case "focus-tab" where isUUID(target):
                 _ = run(["rpc", "surface.focus", jsonArg(["surface_id": target])])
+            case "open-notif" where isUUID(target):
+                // cmux 네이티브: 해당 surface 포커스 + 알림 읽음처리를 한 번에.
+                _ = run(["open-notification", "--id", target])
+            case "statuses":
+                // 사이드바 상태(결정 필·사분면·Running)를 카드에 실을 재료.
+                // list-status가 워크스페이스당 ~0.4s 서브프로세스라 상태 폴에 못 끼움 —
+                // 웹이 '카드에 보이는 워크스페이스만' 지연 요청한다 (최대 6개).
+                let ids = target.split(separator: ",").map(String.init)
+                    .filter(isUUID).prefix(6)
+                var out: [String: [[String: Any]]] = [:]
+                for id in ids { out[id] = listStatus(id) }
+                let payload: [String: Any] = ["t": "cmuxStatuses", "statuses": out]
+                if let data = try? JSONSerialization.data(withJSONObject: payload),
+                   let json = String(data: data, encoding: .utf8) { reply(json) }
+                else { reply("{\"t\":\"cmuxStatuses\",\"statuses\":{}}") }
+                return
             default:
                 return   // 화이트리스트 밖 → 무시
             }
             reply(stateJSON())
         }
+    }
+
+    /// `list-status --workspace <id>` 출력 파싱 — 줄 형식:
+    /// `omni-ask=탭9·힌트… icon=questionmark.bubble.fill color=#FFD60A priority=92`
+    /// value에 공백이 올 수 있어 오른쪽 끝에서 priority/color/icon 순으로 떼어낸다.
+    private static func listStatus(_ wsID: String) -> [[String: Any]] {
+        guard let data = run(["list-status", "--workspace", wsID]),
+              let text = String(data: data, encoding: .utf8) else { return [] }
+        var items: [[String: Any]] = []
+        for raw in text.split(separator: "\n") {
+            var line = String(raw)
+            var icon = "", color = "", priority = 0
+            if let r = line.range(of: " priority=", options: .backwards) {
+                priority = Int(line[r.upperBound...].trimmingCharacters(in: .whitespaces)) ?? 0
+                line = String(line[..<r.lowerBound])
+            }
+            if let r = line.range(of: " color=", options: .backwards) {
+                color = String(line[r.upperBound...]).trimmingCharacters(in: .whitespaces)
+                line = String(line[..<r.lowerBound])
+            }
+            if let r = line.range(of: " icon=", options: .backwards) {
+                icon = String(line[r.upperBound...]).trimmingCharacters(in: .whitespaces)
+                line = String(line[..<r.lowerBound])
+            }
+            guard let eq = line.firstIndex(of: "=") else { continue }
+            items.append([
+                "key": String(line[..<eq]),
+                "text": String(line[line.index(after: eq)...]),
+                "icon": icon, "color": color, "priority": priority,
+            ])
+        }
+        return items.sorted { ($0["priority"] as? Int ?? 0) > ($1["priority"] as? Int ?? 0) }
     }
 
     private static func jsonArg(_ dict: [String: String]) -> String {
@@ -144,6 +207,61 @@ enum CmuxBridge {
     static func terminalInput(_ text: String) {
         guard !text.isEmpty else { return }
         queue.async { _ = run(["rpc", "mobile.terminal.input", jsonArg(["text": text])]) }
+    }
+
+    // MARK: - 세션별 원격 (포커스를 뺏지 않는 read/send — cmux CLI --workspace/--surface 타깃)
+    //
+    // 폰 세션 카드의 핵심: 다른 워크스페이스에서 일하는 중에도 특정 세션의 화면을 읽고
+    // 프롬프트를 던질 수 있다. 맥 앞 사용자의 포커스는 건드리지 않는다.
+
+    /// 허용 키 화이트리스트 (LAN 서버라 임의 키 조합은 금지 — 승인/중단/탐색만)
+    private static let allowedKeys: Set<String> = ["enter", "escape", "ctrl+c", "up", "down", "tab"]
+
+    private static func targetFlag(_ scope: String) -> String? {
+        scope == "workspace" ? "--workspace" : (scope == "surface" ? "--surface" : nil)
+    }
+
+    /// read-screen — 해당 세션의 화면을 포커스 이동 없이 읽는다.
+    /// surface 타깃이 현재 포커스된 탭이면 mobile.terminal.replay의 컬러 그리드를 먼저 시도
+    /// (배경 탭은 cmux가 그리드를 유지하지 않아 실패 → 플레인 텍스트 폴백).
+    static func readTarget(scope: String, id: String, lines: Int, reply: @escaping (String) -> Void) {
+        guard let flag = targetFlag(scope), isUUID(id) else {
+            reply("{\"t\":\"csessRead\",\"error\":true}"); return
+        }
+        let n = max(10, min(lines, 1000))
+        queue.async {
+            if scope == "surface",
+               let gdata = run(["rpc", "mobile.terminal.replay", jsonArg(["terminal_id": id])]),
+               let gobj = (try? JSONSerialization.jsonObject(with: gdata)) as? [String: Any],
+               let grid = gobj["render_grid"] {
+                let payload: [String: Any] = ["t": "csessRead", "id": id, "grid": grid]
+                if let d = try? JSONSerialization.data(withJSONObject: payload),
+                   let s = String(data: d, encoding: .utf8) { reply(s); return }
+            }
+            guard let data = run(["read-screen", flag, id, "--lines", String(n)]),
+                  let text = String(data: data, encoding: .utf8) else {
+                reply("{\"t\":\"csessRead\",\"id\":\"\(id)\",\"error\":true}"); return
+            }
+            let payload: [String: Any] = ["t": "csessRead", "id": id, "text": text]
+            if let d = try? JSONSerialization.data(withJSONObject: payload),
+               let s = String(data: d, encoding: .utf8) { reply(s) }
+            else { reply("{\"t\":\"csessRead\",\"id\":\"\(id)\",\"error\":true}") }
+        }
+    }
+
+    /// send — 프롬프트 텍스트를 해당 세션으로 전송 (submit 시 enter까지).
+    static func sendTarget(scope: String, id: String, text: String, submit: Bool) {
+        guard let flag = targetFlag(scope), isUUID(id), !text.isEmpty else { return }
+        queue.async {
+            _ = run(["send", flag, id, "--", text])
+            if submit { _ = run(["send-key", flag, id, "enter"]) }
+        }
+    }
+
+    /// send-key — 승인(enter)/중단(escape, ctrl+c)/탐색 키만 화이트리스트로 허용.
+    static func sendKeyTarget(scope: String, id: String, key: String) {
+        guard let flag = targetFlag(scope), isUUID(id), allowedKeys.contains(key) else { return }
+        queue.async { _ = run(["send-key", flag, id, key]) }
     }
 
     /// 창 + 창별 워크스페이스 + 선택 워크스페이스의 탭(터미널)을 한 페이로드로 만든다.
@@ -182,27 +300,97 @@ enum CmuxBridge {
                 ])
             }
         }
-        // 선택된 워크스페이스의 탭(터미널) — 제목에 에이전트 상태가 실려 있어 원격 확인에 유용
+        // 전 워크스페이스의 탭(터미널) — 제목에 에이전트 상태가 실려 있어 원격 확인에 유용.
+        // tabs = 선택 워크스페이스(기존 계약 유지), sessions = 전체 (세션 카드용).
         var tabs: [[String: Any]] = []
+        var sessions: [[String: Any]] = []
         if let tdata = run(["rpc", "mobile.workspace.list", "{}"]),
            let obj = (try? JSONSerialization.jsonObject(with: tdata)) as? [String: Any],
-           let items = obj["workspaces"] as? [[String: Any]],
-           let selected = items.first(where: { ($0["is_selected"] as? Bool) == true }),
-           let terms = selected["terminals"] as? [[String: Any]] {
-            for term in terms {
-                tabs.append([
-                    "id": term["id"] as? String ?? "",
-                    "title": term["title"] as? String ?? "터미널",
-                    "focused": term["is_focused"] as? Bool ?? false,
+           let items = obj["workspaces"] as? [[String: Any]] {
+            // 그룹 id → 이름 (카드의 "소속" 표기용)
+            var groupName: [String: String] = [:]
+            for g in (obj["groups"] as? [[String: Any]]) ?? [] {
+                if let gid = g["id"] as? String { groupName[gid] = g["name"] as? String ?? "" }
+            }
+            for ws in items {
+                let selected = (ws["is_selected"] as? Bool) == true
+                var terms: [[String: Any]] = []
+                for term in (ws["terminals"] as? [[String: Any]]) ?? [] {
+                    let entry: [String: Any] = [
+                        "id": term["id"] as? String ?? "",
+                        "title": term["title"] as? String ?? "터미널",
+                        "focused": term["is_focused"] as? Bool ?? false,
+                    ]
+                    terms.append(entry)
+                    if selected { tabs.append(entry) }
+                }
+                sessions.append([
+                    "id": ws["id"] as? String ?? "",
+                    "title": ws["title"] as? String ?? "(무제)",
+                    "selected": selected,
+                    "terminals": terms,
+                    // 카드 색 매칭 + 소속 표기: 워크스페이스 색·그룹 이름
+                    "color": ws["custom_color"] as? String ?? "",
+                    "group": groupName[ws["group_id"] as? String ?? ""] ?? "",
                 ])
             }
         }
         // list-windows 가 성공한 지점이라 인증은 정상 — denied 는 false.
-        let payload: [String: Any] = ["t": "cmux", "available": available, "denied": false, "windows": windows, "tabs": tabs]
+        // notifications: cmux 알림 피드에서 "지금 나를 기다리는 세션"(에이전트 상태) — 워크스페이스 교차.
+        let payload: [String: Any] = ["t": "cmux", "available": available, "denied": false,
+                                       "windows": windows, "tabs": tabs, "sessions": sessions,
+                                       "notifications": notificationsJSON()]
         guard let data = try? JSONSerialization.data(withJSONObject: payload),
               let json = String(data: data, encoding: .utf8)
         else { return "{\"t\":\"cmux\",\"available\":false,\"windows\":[],\"tabs\":[]}" }
         return json
+    }
+
+    // MARK: - 에이전트 알림 (⑤ AGENT_STATE — "지금 나를 기다리는 세션")
+
+    /// cmux 알림 피드에서 액션가능한 세션 상태를 뽑아 폰에 회신.
+    /// `list-notifications --json` = cmux 가 Claude Code 훅으로 만든 시맨틱 상태 소스라, 터미널
+    /// 화면을 정규식으로 긁을 필요가 없다. cmux `subtitle` 은 일관성이 없어(같은 대기인데 빈 값도
+    /// 있음) body 텍스트로 카테고리를 정규화한다 — 파싱 지식을 여기 한 곳에 가둔다.
+    /// 필터(사용자 확정): unread 이거나 아직 waiting/permission 인 것 + 최근 48h + 최신순 상위 15.
+    private static let notifISO = ISO8601DateFormatter()
+
+    private static func notifCategory(subtitle: String, body: String) -> String {
+        if subtitle.hasPrefix("Completed") { return "completed" }
+        if subtitle == "Permission" || body.localizedCaseInsensitiveContains("needs your permission") { return "permission" }
+        if subtitle == "Waiting" || body.localizedCaseInsensitiveContains("waiting for your input") { return "waiting" }
+        return "other"
+    }
+
+    private static func notificationsJSON() -> [[String: Any]] {
+        guard let data = run(["list-notifications", "--json"]),
+              let items = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]]
+        else { return [] }   // best-effort — 실패해도 상태 폴링 전체를 막지 않는다.
+
+        let cutoff = Date().addingTimeInterval(-48 * 3600)
+        var out: [[String: Any]] = []
+        for it in items {   // CLI 는 최신순으로 준다 → 그대로 순회 + 상위 15 캡.
+            let sub = (it["subtitle"] as? String) ?? ""
+            let body = (it["body"] as? String) ?? ""
+            let read = (it["is_read"] as? Bool) ?? false
+            let cat = notifCategory(subtitle: sub, body: body)
+            let actionable = (cat == "waiting" || cat == "permission")
+            guard !read || actionable else { continue }
+            let ts = (it["created_at"] as? String) ?? ""
+            if let d = notifISO.date(from: ts), d < cutoff { continue }   // stale 유령 컷
+            out.append([
+                "id": it["id"] as? String ?? "",
+                "cat": cat,
+                "body": String(body.prefix(120)),
+                "read": read,
+                "ts": ts,
+                "surface": it["surface_id"] as? String ?? "",
+                "ws": it["workspace_id"] as? String ?? "",
+                "wsTitle": it["tab_title"] as? String ?? "",
+            ])
+            if out.count >= 15 { break }
+        }
+        return out
     }
 
     /// cmux CLI 실행. 소켓 인증 실패면 cmux.json 을 복구(ensureConfigured)하고 1회 재시도한다.
@@ -213,7 +401,7 @@ enum CmuxBridge {
         if result.status == 0 { return result.stdout }
 
         let errStr = String(data: result.stderr, encoding: .utf8) ?? ""
-        debugLog("exit \(result.status) \(args.joined(separator: " ")): \(errStr)")
+        debugLog("exit \(result.status) \(args.prefix(2).joined(separator: " ")): \(errStr)")
 
         // 인증 실패 감지 → self-heal 후 1회 재시도.
         // ⚠️ cmux reload-config 는 인증이 필요해 이 상황(패스워드 없음)에선 실패한다(닭-달걀).
@@ -256,8 +444,9 @@ enum CmuxBridge {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: cliPath)
         process.arguments = args
+        guard let pass = canonicalPassword() else { return nil }
         var env = ProcessInfo.processInfo.environment
-        env["CMUX_SOCKET_PASSWORD"] = canonicalPassword()   // 우리가 관리하는 고정 패스워드
+        env["CMUX_SOCKET_PASSWORD"] = pass   // cmux CLI가 요구하는 프로세스 한정 인증 전달
         process.environment = env
         let out = Pipe(); let err = Pipe()
         process.standardOutput = out
@@ -280,22 +469,22 @@ enum CmuxBridge {
         }
         if exitDone.wait(timeout: .now() + 2) == .timedOut {
             process.terminate()
-            debugLog("timeout: \(args.joined(separator: " "))")
+            debugLog("timeout: \(args.prefix(2).joined(separator: " "))")
             return nil
         }
         _ = readDone.wait(timeout: .now() + 1)
         return (data, errData, process.terminationStatus)
     }
 
-    /// 브리지 문제 진단용 로그 (/tmp/macpilot-cmux.log)
+    /// 브리지 문제 진단용 로그. 사용자 프롬프트/타깃 값은 기록하지 않는다.
     private static func debugLog(_ message: String) {
         let line = "[\(Date())] \(message)\n"
-        if let handle = FileHandle(forWritingAtPath: "/tmp/macpilot-cmux.log") {
+        if let handle = FileHandle(forWritingAtPath: "/tmp/cmdpilot-cmux.log") {
             handle.seekToEndOfFile()
             handle.write(Data(line.utf8))
             try? handle.close()
         } else {
-            try? line.write(toFile: "/tmp/macpilot-cmux.log", atomically: true, encoding: .utf8)
+            try? line.write(toFile: "/tmp/cmdpilot-cmux.log", atomically: true, encoding: .utf8)
         }
     }
 }

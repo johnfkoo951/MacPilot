@@ -1,13 +1,14 @@
-# CmdSpace Pilot — 개발 현황 기술 문서
+# CmdSpace Pilot — 개발 현황 기술 문서 (2026-07-03 스냅샷)
 
 > 최종 갱신: 2026-07-03 (커밋 `09038cf` 기준)
-> 업스트림: joonlab/MacPilot (MIT) 의 구요한(johnfkoo951) 브랜드 포크
+> 업스트림: joonlab/MacPilot (MIT)의 CMDSPACE 브랜드 포크
+> 이후 아키텍처와 운영 규칙은 [AGENTS.md](../AGENTS.md), 최신 기능은 [CHANGELOG.md](../CHANGELOG.md)가 정본이다.
 
 ## 1. 제품 개요
 
 Mac을 폰 브라우저에서 조작하는 무선 트랙패드 / 키보드 / Stream-Deck.
 
-- Mac 쪽: 메뉴바 상주 Swift 헬퍼(`LSUIElement`)가 LAN에서 HTTP + WebSocket 서버 구동 (이 머신에서는 **포트 8766** — 8765는 OmniControl 브리지가 점유)
+- Mac 쪽: 메뉴바 상주 Swift 헬퍼(`LSUIElement`)가 LAN에서 HTTP + WebSocket 서버 구동 (기본 **포트 8766**)
 - 폰 쪽: 브라우저로 URL을 열면 바닐라 HTML/JS 웹 클라이언트가 서빙됨. 별도 앱 설치 불필요 (PWA 홈 화면 추가 지원)
 - 제스처/탭 입력이 플랫 JSON 명령으로 WebSocket을 타고 넘어오면, Mac이 Quartz Event Services(`CGEvent`)로 실제 입력을 주입
 - 의존성 제로: SwiftPM 패키지 없음, JS 라이브러리 없음, 프레임워크 없음
@@ -53,11 +54,11 @@ Mac을 폰 브라우저에서 조작하는 무선 트랙패드 / 키보드 / Str
 | `EventInjector.swift` | 302 | 입력 합성 유일 지점. 단일 직렬 큐로 드래그 상태·이벤트 순서 보장. `move/down/up/click/scroll/key/text/macro/launch/gesture/zoom/volume/brightness` 디스패치. 소켓 끊기면 `releaseAll()` |
 | `InboundCommand.swift` | 40 | **와이어 계약** — 전 필드 옵셔널의 플랫 Decodable 구조체 + `MacroStep`. app.js 와 반드시 동기 유지 |
 | `CmuxBridge.swift` | 164 | cmux CLI/RPC 브리지 (아래 §4) |
-| `DeckStore.swift` | 24 | 덱 JSON을 `~/Library/Application Support/MacPilot/deck.json`에 원문 저장. Mac이 단일 저장소 → 모든 기기가 한 덱 공유 |
+| `DeckStore.swift` | 24 | 덱 JSON을 `~/Library/Application Support/CmdPilot/deck.json`에 원문 저장. Mac이 단일 저장소 → 모든 기기가 한 덱 공유 |
 | `AppList.swift` | 54 | 설치 앱(경로·이름·아이콘) 스캔, 덱 launch 액션 피커용 |
 | `MediaKeys.swift` / `SpaceSwitcher.swift` | 33/100 | HID 미디어 키(볼륨·밝기) / 3손가락 스와이프 → Mission Control·스페이스 전환 |
 | `MenuContentView.swift` | 316 | SwiftUI 메뉴바 UI — URL·QR, 권한 안내, 진단, 서버 제어 |
-| `MacPilotHelperApp.swift` / `NetworkInfo.swift` | 17/40 | 앱 엔트리 / mDNS `.local`·IPv4 주소 해석 |
+| `CmdPilotHelperApp.swift` / `NetworkInfo.swift` | 17/40 | 앱 엔트리 / mDNS `.local`·IPv4 주소 해석 |
 
 ### 3.2 폰 측 (`MacHelper/Web/`)
 
@@ -75,12 +76,13 @@ Mac을 폰 브라우저에서 조작하는 무선 트랙패드 / 키보드 / Str
 
 폰의 에이전트 탭에서 Mac의 cmux(터미널 멀티플렉서) 창/워크스페이스/탭을 전환·모니터링한다. 탭 제목에 에이전트 상태가 실려 있어 원격에서 Claude Code 등 에이전트 진행 상황 확인이 목적.
 
-- **보안 설계** (서버가 LAN 무인증이므로 핵심):
-  - 동사 화이트리스트만 처리: `state` / `select-workspace` / `focus-window` / `focus-tab`
+- **보안 설계**:
+  - cmux/터미널/세션 통합은 PIN 페어링과 현재 인증 epoch가 유효한 연결에서만 처리
+  - 동사 화이트리스트만 처리: `state` / `select-workspace` / `focus-window` / `focus-tab` / `open-notif` / `statuses`
   - 대상 인자는 UUID 형식만 통과, 셸 미경유(Process 인자 배열 직접 전달) — 임의 명령 실행 불가
-  - cmux 소켓 패스워드는 `~/.config/cmux/cmux.json`(JSONC)에서 정규식으로 읽어 환경변수로만 전달, 폰에 절대 노출 안 함
-- **상태 페이로드**: `list-windows` + 창별 `list-workspaces` + `mobile.workspace.list`(선택 워크스페이스의 터미널 탭)를 한 JSON으로 합성. 소켓 접근 거부(`cmuxOnly` 모드) 감지 시 `denied: true`로 폰 UI가 안내 문구 표시
-- **실행 안전장치**: CLI 호출 3초 타임아웃, 파이프는 종료 대기 전 비동기 읽기(데드락 방지), 진단 로그 `/tmp/macpilot-cmux.log`
+  - cmux 소켓 패스워드의 정본은 macOS Keychain이며, self-heal 때 권한 `0600`인 cmux 설정에 일시 미러
+- **상태 페이로드**: `list-windows` + 창별 `list-workspaces` + `mobile.workspace.list` + 알림을 합쳐 `windows[]`, `tabs[]`, `sessions[]`, `notifications[]`로 회신
+- **실행 안전장치**: CLI 호출 2초 타임아웃, 파이프 비동기 읽기, 프롬프트를 남기지 않는 진단 로그 `/tmp/cmdpilot-cmux.log`
 
 ## 5. 와이어 프로토콜
 
@@ -96,7 +98,10 @@ Mac을 폰 브라우저에서 조작하는 무선 트랙패드 / 키보드 / Str
 | `volume` / `brightness` | 폰→Mac | 시스템 HID 키 |
 | `getDeck` / `saveDeck` | 양방향 | 덱 동기화 |
 | `getApps` | 양방향 | 설치 앱 목록 |
-| `cmux` (`dir`=동사, `target`=UUID) | 양방향 | cmux 브리지, 응답은 `{t:"cmux", available, denied, windows[], tabs[]}` |
+| `cmux` (`dir`=동사, `target`=UUID) | 양방향 | cmux 브리지, 상태·알림·워크스페이스 전환 |
+| `cterm` | 양방향 | 현재 터미널 컬러 grid 읽기·입력 |
+| `csess` | 양방향 | UUID 타깃 세션 read/send/허용 키 전송 |
+| `omni*` | 양방향 | Keychain 토큰을 쓰는 선택적 loopback 상태·검색·결정 프록시 |
 
 ## 6. 빌드·배포·운영
 
@@ -107,10 +112,11 @@ xcodegen generate              # 파일 추가/삭제 후 필수 (프로젝트�
 ./script/macpilotctl.sh sync-web   # 웹만 고칠 땐 rsync → 재빌드 불필요
 ```
 
-- **웹 오버라이드**: 서버는 `~/Library/Application Support/MacPilot/web/`을 번들보다 우선 서빙 → 웹 수정 시 재빌드(=재서명=접근성 권한 리셋) 회피
-- **서명 전략**: deploy.sh가 키체인의 Apple Development 인증서로 서명(안정 아이덴티티 → 접근성 권한 유지), 없으면 ad-hoc 폴백(재빌드마다 권한 재부여 필요)
+- **웹 오버라이드**: 서버는 `~/Library/Application Support/CmdPilot/web/`을 번들보다 우선 서빙 → 웹 수정 시 재빌드 회피. ad-hoc 서명 환경에서는 권한 리셋도 피할 수 있음
+- **프로토콜 변경 배포**: Swift와 웹 와이어 계약을 함께 바꿨다면 `deploy.sh` 사용. 기존 웹 override도 새 소스로 동기화한 뒤 재시작
+- **서명 전략**: deploy/package 스크립트가 `CODESIGN_IDENTITY` → 유일한 Apple Development → 유일한 유효 identity 순으로 선택합니다. 후보가 여러 개면 명시값을 요구합니다. identity가 없을 때는 Keychain ACL·접근성 권한 단절을 피하려고 기본 실패하며, 임시 빌드만 `ALLOW_ADHOC_SIGNING=1`로 명시할 수 있습니다.
 - **launchd**: 상시 서버. plist 없으면 deploy.sh가 자동 생성. Xcode 실행과 동시 구동 금지(포트 충돌)
-- 버전은 `project.yml`의 `MARKETING_VERSION`. 번들 ID `com.joonlab.macpilot(.helper)`
+- 버전은 `project.yml`의 `MARKETING_VERSION`. 번들 ID `com.cmdspace.cmdpilot.helper`
 
 ## 7. 런타임 요구사항 (주의점)
 
@@ -119,7 +125,8 @@ xcodegen generate              # 파일 추가/삭제 후 필수 (프로젝트�
 
 ## 8. 남은 과제 / 알려진 제약
 
-- LAN 무인증 — 신뢰 네트워크 밖 사용 시 인증 계층 필요 (미구현)
+- 기본 원격 입력은 신뢰 LAN/사설 tailnet 전용이며, 공용 네트워크에서는 PIN 페어링 필수
+- 세션 통합은 네트워크와 무관하게 PIN 페어링이 켜져야 동작
 - 테스트 스위트·린터 없음
 - cmux 브리지는 cmux 앱 경로(`/Applications/cmux.app`) 하드코딩, 소켓 password 모드 필요
 - 웹 자산은 번들 리소스 → 폰 반영엔 재배포 또는 sync-web 필요

@@ -280,6 +280,7 @@ textarea.ed-input { min-height: 80px; resize: none; }
 .gesture-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 8px 0; }
 .gesture-row label { font-size: 13px; color: var(--text); flex: 0 0 auto; }
 .gesture-row select { flex: 1; max-width: 210px; background: var(--surface-2); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 13px; }
+.gesture-row .set-text { flex: 1; min-width: 0; max-width: 210px; background: var(--surface-2); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 13px; -webkit-user-select: text; user-select: text; }
 
 /* 캡처 메뉴 / 결과 */
 .cap-actions { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
@@ -358,6 +359,10 @@ html.docked #trackpad { border: 1px solid var(--border); }
 html.docked #click-bar { padding: 0; }
 html.docked #quickbar, html.docked #quickbar2 { justify-content: center; }
 html.docked #quickbar button, html.docked #quickbar2 button { max-width: 150px; }
+/* 가로 퀵바는 파일 끝 '우측 세로 레일' 블록이 담당한다 (2026-08-23).
+   여기 있던 '퀵바 2줄 좌우 배치'는 레일로 대체돼 제거 — 두 규칙이 공존하면
+   어느 쪽이 이기는지가 파일 순서에 의존해 헷갈린다. */
+#quickwrap { flex: 0 0 auto; }
 /* 대형/소형 태블릿: 덱 셀·아이콘 키워 터치 여유 */
 html.tablet-lg .deck-btn { min-height: 92px; font-size: 15px; }
 html.tablet-lg .deck-btn .ic { font-size: 26px; }
@@ -460,6 +465,75 @@ html.tablet-lg .deck-page.apps .deck-btn .ic-img { width: 46px; height: 46px; }
 .term-input { margin-top: 8px; width: 100%; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 10px; padding: 12px; font-size: 16px; -webkit-user-select: text; user-select: text; }
 .term-input:focus { outline: 2px solid var(--accent); border-color: var(--accent); }
 
+/* ───────── 세션 검색 탭 ───────── */
+.srch-bar { display: flex; align-items: center; gap: 8px; margin-top: 12px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 0 12px; }
+.srch-icn { width: 18px; height: 18px; color: var(--text-mute); flex: 0 0 auto; }
+#srch-input { flex: 1; background: none; border: none; color: var(--text);
+  font-size: 16px; padding: 13px 0; outline: none; -webkit-user-select: text; user-select: text; }
+.srch-bar:focus-within { border-color: var(--accent); }
+#srch-clear { background: var(--surface-2); color: var(--text-dim); border: none;
+  border-radius: 50%; width: 26px; height: 26px; font-size: 13px; flex: 0 0 auto; }
+.srch-recent { display: flex; gap: 6px; flex-wrap: wrap; }
+.srch-recent:empty { display: none; }
+.srch-chip { padding: 7px 12px; background: var(--surface-2); color: var(--text-dim);
+  border: none; border-radius: 999px; font-size: 12px; }
+.srch-chip:active { background: var(--accent); color: var(--accent-text); }
+.srch-results { flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch;
+  display: flex; flex-direction: column; gap: 7px; }
+.srch-row { display: block; width: 100%; text-align: left;
+  background: var(--surface); color: var(--text); border: 1px solid var(--border);
+  border-radius: 12px; padding: 11px 13px; }
+.srch-row:active { background: var(--surface-2); }
+.srch-row.busy { opacity: .55; }
+.srch-row.srch-back { background: var(--surface-2); border-style: dashed; padding: 9px 13px; }
+.srch-main { font-weight: 700; font-size: 14px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.srch-sub { margin-top: 3px; font-size: 12px; color: var(--text-dim); }
+.srch-snip { margin-top: 5px; font-size: 12px; line-height: 1.45; color: var(--text-dim);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.srch-snip b { color: var(--accent); font-weight: 800; }
+
+/* 음성 상태 필 — 녹음/인식 중일 때 상단 중앙 (버튼 하이라이트와 동시) */
+#voice-pill {
+  position: fixed; left: 50%; transform: translateX(-50%); z-index: 75;
+  top: calc(env(safe-area-inset-top, 0px) + 48px);
+  display: flex; align-items: center; gap: 7px;
+  background: var(--surface); border: 1px solid var(--accent); border-radius: 999px;
+  padding: 9px 16px; font-size: 13px; font-weight: 700; color: var(--text);
+  box-shadow: 0 8px 24px var(--shadow); white-space: nowrap; max-width: 90vw;
+}
+#voice-pill[hidden] { display: none; }
+#voice-pill .vp-dot { width: 9px; height: 9px; border-radius: 50%; background: #ff5c5c;
+  animation: muxpulse 1s ease-in-out infinite; flex: 0 0 auto; }
+#voice-pill.processing .vp-dot { background: var(--warn); animation: none; }
+/* 퀵바 음성 버튼: 해당 레인이 녹음 중이면 적색 펄스, 인식 중이면 주황 */
+#quickbar button.rec { border-color: #ff5c5c; color: #ff5c5c;
+  animation: muxpulse 1s ease-in-out infinite; }
+#quickbar button.proc { border-color: var(--warn); color: var(--warn); }
+
+/* PTT 전송 확인 배너 (모바일 미러) — 어느 탭에서든 상단에 뜬다 */
+#ptt-banner {
+  position: fixed; left: 10px; right: 10px; z-index: 80;
+  top: calc(env(safe-area-inset-top, 0px) + 46px);
+  background: var(--surface); border: 1px solid var(--accent); border-radius: 14px;
+  padding: 12px 14px; box-shadow: 0 10px 30px var(--shadow);
+  max-width: 560px; margin: 0 auto;
+}
+#ptt-banner[hidden] { display: none; }
+.pb-head { font-size: 13px; font-weight: 800; color: var(--accent); margin-bottom: 6px; }
+.pb-text { font-size: 14px; line-height: 1.45; margin-bottom: 9px; -webkit-user-select: text; user-select: text; }
+.pb-sessions { display: flex; flex-direction: column; gap: 5px; max-height: 40vh; overflow-y: auto; }
+.pb-sess { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+  padding: 10px 12px; background: var(--surface-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 10px; font-size: 14px; }
+.pb-sess.on { border-color: var(--accent); font-weight: 700; }
+.pb-sess:active { background: var(--accent); color: var(--accent-text); }
+.pb-foot { display: flex; gap: 8px; margin-top: 10px; }
+.pb-foot button { flex: 1; padding: 11px 0; border: none; border-radius: 10px;
+  background: var(--surface-2); color: var(--text); font-size: 14px; }
+.pb-primary { background: var(--accent) !important; color: var(--accent-text) !important; font-weight: 700; }
+
 /* 토스트 */
 #toast { position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom, 0px) + 78px); transform: translateX(-50%);
   background: rgba(20,22,28,.94); color: #fff; padding: 10px 16px; border-radius: 12px; font-size: 14px;
@@ -495,3 +569,165 @@ html.kb-open #panel-term .term-screen { margin-top: 6px; }
 #mirror-kbd.on { background: var(--accent); color: var(--accent-text); }
 /* 물리 키보드 대상 표시(터미널 입력창) */
 #term-input:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+/* ───────── 대기 결정 카드 (에이전트 탭 상단) ───────── */
+.sess-cards { display: flex; flex-direction: column; gap: 8px; margin-bottom: 4px; }
+.sess-head { margin: 2px 2px 0; }
+.sess-card {
+  display: block; width: 100%; text-align: left;
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: 12px;
+  padding: 11px 13px; color: var(--text);
+  border-left: 4px solid var(--warn);
+}
+.sess-card.cat-permission { border-left-color: var(--accent); }
+.sess-card:active { background: var(--surface-3); }
+.sc-top { display: flex; align-items: baseline; gap: 8px; }
+.sc-title { font-weight: 700; font-size: 14px; flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sc-badge { font-size: 11px; font-weight: 700; color: var(--warn); flex-shrink: 0; }
+.sess-card.cat-permission .sc-badge { color: var(--accent); }
+.sc-time { font-size: 11px; color: var(--text-mute); flex-shrink: 0; }
+.sc-headline { margin-top: 5px; font-size: 12.5px; color: var(--text-dim); line-height: 1.45;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+
+/* ───────── 세션 상세 시트 (read-screen + 세션별 프롬프트) ───────── */
+#sess-sheet[hidden] { display: none; }   /* display:flex가 hidden 속성을 덮지 않게 */
+#sess-sheet {
+  position: fixed; inset: 0; z-index: 40;
+  background: var(--bg); display: flex; flex-direction: column;
+  padding: max(10px, env(safe-area-inset-top)) 12px max(10px, env(safe-area-inset-bottom));
+}
+.ss-head { display: flex; align-items: center; gap: 10px; padding: 4px 2px 10px; }
+.ss-titles { flex: 1; min-width: 0; }
+#ss-title { font-weight: 800; font-size: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ss-sub { font-size: 12px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#ss-goto {
+  padding: 8px 14px; border-radius: 10px; border: 1px solid var(--border);
+  background: var(--surface-2); color: var(--text); font-size: 13px; font-weight: 600;
+}
+#ss-close {
+  padding: 8px 12px; border-radius: 10px; border: none;
+  background: var(--surface-2); color: var(--text-dim); font-size: 15px;
+}
+#ss-term {
+  flex: 1; margin: 0; overflow: auto; -webkit-overflow-scrolling: touch;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  padding: 10px 12px; font: 11px/1.5 ui-monospace, "SF Mono", Menlo, monospace;
+  color: var(--text); white-space: pre; overscroll-behavior: contain;
+}
+.ss-keys { display: flex; gap: 6px; padding: 10px 0 0; }
+.ss-keys button {
+  flex: 1; padding: 10px 0; border-radius: 10px; border: 1px solid var(--border);
+  background: var(--surface-2); color: var(--text); font-size: 13px; font-weight: 600;
+}
+.ss-keys button:active { background: var(--accent); color: var(--accent-text); }
+.ss-input-row { display: flex; gap: 8px; padding-top: 8px; align-items: stretch; }
+#ss-input {
+  flex: 1; resize: none; border-radius: 10px; border: 1px solid var(--border);
+  background: var(--surface); color: var(--text); padding: 9px 11px;
+  font-size: 16px; line-height: 1.4;   /* 16px = iOS 자동 확대 방지 */
+}
+#ss-input:focus { outline: 2px solid var(--accent); border-color: var(--accent); }
+#ss-send {
+  padding: 0 18px; border-radius: 10px; border: none;
+  background: var(--accent); color: var(--accent-text); font-size: 14px; font-weight: 700;
+}
+
+/* 워크스페이스 색 매칭: 제목 앞 색점 + 소속 그룹 + 사이드바 필 코멘터리 */
+.sc-wsdot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 7px; vertical-align: baseline; }
+.sc-group { margin-left: 7px; font-size: 11px; font-weight: 600; color: var(--text-mute); }
+.sc-pills { margin-top: 5px; display: flex; flex-wrap: wrap; gap: 4px 12px; }
+/* 원클릭 답장 칩 (에이전트가 제안한 후속 프롬프트 → 탭 한 번에 그 세션으로 전송) */
+.sc-actions { margin-top: 7px; display: flex; flex-wrap: wrap; gap: 6px; }
+.sc-act { display: inline-block; padding: 7px 12px; background: var(--surface-3); color: var(--text);
+  border: 1px solid var(--border); border-radius: 999px; font-size: 12px; font-weight: 600;
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sc-act:active { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+.sc-pill { font-size: 11.5px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+
+/* 카드의 세션(탭) 구분 줄 — 탭 제목(에이전트 진행상황) 또는 cwd 폴더 */
+.sc-tab {
+  margin-top: 4px; font-size: 12px; font-weight: 600; color: var(--text-dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* cmux 알림 인박스("나를 기다리는 세션") 최소 스타일 — 카드와 시각 언어 통일 */
+.notif-list { display: flex; flex-direction: column; gap: 5px; margin: 6px 0 2px; }
+.notif-row {
+  display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px;
+  padding: 8px 11px; color: var(--text); font-size: 12.5px;
+}
+.notif-row:active { background: var(--surface-3); }
+.notif-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--warn); flex-shrink: 0; }
+.notif-row.cat-permission .notif-dot { background: var(--accent); }
+.notif-row.cat-completed .notif-dot { background: var(--ok); }
+.notif-main { flex: 1; min-width: 0; display: flex; gap: 6px; align-items: baseline;
+  overflow: hidden; }
+.notif-ws { font-weight: 700; flex-shrink: 0; }
+.notif-cat { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.notif-time { color: var(--text-mute); font-size: 11px; flex-shrink: 0; }
+
+/* 세션 시트: 기기 가로폭에 맞춘 줄바꿈 (가로 스크롤 대신 랩) + 컬러 그리드 지원 */
+#ss-term { white-space: pre-wrap; overflow-wrap: break-word; }
+#ss-term .tline { white-space: pre-wrap; word-break: break-all; min-height: 1em; }
+
+/* ═════════ 태블릿 가로: 우측 세로 레일 + 본문 다중 컬럼 (2026-08-23) ═════════
+   가로에서는 수직 스크롤이 짧다. 하단 퀵바 2줄이 69px를 먹었고, 소프트 키보드가
+   뜨면 `html.kb-open` 규칙이 퀵바를 통째로 숨겨서 — 타이핑 중 받아쓰기로 바꾸려는
+   바로 그 순간 — 음성/받아쓰기 버튼이 사라졌다.
+   → 가로 도킹에서는 퀵바를 우측 세로 레일로 옮기고, 키보드가 떠도 유지한다. */
+:root { --rail-w: 84px; }
+
+/* 조건은 `wide`(태블릿) + 가로 — `docked`가 아니다.
+   docked 는 min(vw,vh) ≥ 680 을 요구하는데, Safari 주소창·툴바를 뺀 iPad mini 가로는
+   654px 라 도킹 판정이 안 떨어진다(실측). 레일이 필요한 건 '수직이 짧은 가로'이지
+   '멀티패널이 켜진 상태'가 아니므로 도킹과 분리한다. */
+html.wide.orient-land body { padding-right: calc(var(--rail-w) + env(safe-area-inset-right)); }
+html.wide.orient-land #quickwrap {
+  position: fixed; z-index: 60;
+  top: env(safe-area-inset-top); right: 0; bottom: var(--kb-height, 0px);
+  width: calc(var(--rail-w) + env(safe-area-inset-right));
+  flex-direction: column; gap: 6px; align-items: stretch;
+  padding: 8px env(safe-area-inset-right) 8px 0;
+  border-top: none; border-left: 1px solid var(--border); background: var(--bg);
+  overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
+}
+html.wide.orient-land #quickbar,
+html.wide.orient-land #quickbar2 {
+  flex: 0 0 auto; flex-direction: column; gap: 6px;
+  padding: 0 0 0 8px; border-top: none; justify-content: flex-start;
+}
+html.wide.orient-land #quickbar button,
+html.wide.orient-land #quickbar2 button { flex: 0 0 auto; max-width: none; height: 52px; }
+/* 키보드가 떠도 레일 유지 — 받아쓰기는 키보드를 '대체'하는 수단이라 같이 숨으면 안 된다.
+   (일반 하단 퀵바를 숨기는 html.kb-open 규칙을 이 조합에서만 되돌린다) */
+html.wide.orient-land.kb-open #quickbar,
+html.wide.orient-land.kb-open #quickbar2 { display: flex; }
+/* 미러 전체화면: 레일까지 접어 본문 폭 확보 */
+html.mirror-full #quickwrap { display: none !important; }
+html.mirror-full.orient-land body { padding-right: env(safe-area-inset-right); }
+
+/* position:fixed 오버레이는 body 패딩을 못 받는다 — 레일 폭만큼 직접 비켜준다.
+   특히 세션 시트는 프롬프트를 타이핑하는 곳이라 레일(받아쓰기)이 살아 있어야 한다. */
+html.wide.orient-land #sess-sheet { right: calc(var(--rail-w) + env(safe-area-inset-right)); }
+html.wide.orient-land #ptt-banner { right: calc(var(--rail-w) + env(safe-area-inset-right) + 10px); }
+html.wide.orient-land #voice-pill { left: calc(50% - (var(--rail-w) / 2)); }
+
+/* ── 본문 다중 컬럼: 패널 실폭 기준 1→2→3열 ──
+   분할 슬라이더(--panel-fr)로 패널 폭이 연속 변하므로 미디어 쿼리로는 알 수 없다.
+   컨테이너 쿼리로 패널 자신의 폭을 본다. 미지원 브라우저는 1열로 안전하게 남는다. */
+html.wide .panel { container-type: inline-size; }
+.sess-cards { display: grid; grid-template-columns: 1fr; gap: 8px; align-content: start; }
+.srch-results { display: grid; grid-template-columns: 1fr; gap: 7px; align-content: start; }
+/* 섹션 헤더는 항상 전체 폭 (카드와 같은 칸에 들어가면 안 된다) */
+.sess-cards > .agent-sec, .srch-results > .agent-sec { grid-column: 1 / -1; }
+/* 임계값 근거(iPad mini 가로 1133 실측): 레일 84px을 뺀 뒤 기본 분할(58%)에서
+   패널 = 586px → 2열(293px/칸). 컴패니언을 '없음'으로 두면 1049px → 3열(350px/칸).
+   카드 한 칸이 ~260px 밑으로 내려가면 제목이 잘리므로 그 아래로는 열을 늘리지 않는다. */
+@container (min-width: 520px) {
+  .sess-cards, .srch-results { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@container (min-width: 820px) {
+  .sess-cards, .srch-results { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}

@@ -6,8 +6,8 @@ import Network
 /// (현장에서 여러 기기가 동시에 페이지를 받아도 즉시 응답)
 ///
 /// 개발 오버라이드: `~/Library/Application Support/CmdPilot/web/` 에 같은 이름의 파일이 있으면
-/// 번들 캐시 대신 그 파일을 서빙한다 → 웹(HTML/JS/CSS)만 고칠 땐 재빌드(=ad-hoc 재서명으로
-/// 손쉬운 사용 권한 리셋) 없이 반영. 동기화: `./script/macpilotctl.sh sync-web`
+/// 번들 캐시 대신 그 파일을 서빙한다 → 웹(HTML/JS/CSS)만 고칠 땐 재빌드 없이 반영.
+/// ad-hoc 서명을 명시한 환경에서는 권한 리셋도 피할 수 있다. 동기화: `./script/macpilotctl.sh sync-web`
 private enum AssetCache {
     struct Item { let file: String; let data: Data; let mime: String }
 
@@ -58,6 +58,9 @@ private enum AssetCache {
 final class HTTPWebSocketConnection {
     private let connection: NWConnection
     private let pairing: Pairing?
+    private let allowedHosts: Set<String>
+    private let authorizationLock = NSLock()
+    private var pairingAuthorizationEpoch: UInt64?
     private var buffer = [UInt8]()
     private var didUpgrade = false
     private var closing = false
@@ -67,13 +70,23 @@ final class HTTPWebSocketConnection {
     var onUpgrade: (() -> Void)?
     var onClose: (() -> Void)?
 
-    init(connection: NWConnection, pairing: Pairing? = nil) {
+    init(connection: NWConnection, pairing: Pairing? = nil,
+         allowedHosts: Set<String> = ["localhost", "127.0.0.1", "::1"]) {
         self.connection = connection
         self.pairing = pairing
+        self.allowedHosts = Set(allowedHosts.map(Self.normalizedHost))
     }
 
     /// 외부(서버)에서 강제 종료. 페어링을 켤 때 기존 미인증 연결을 끊는 데 사용.
     func forceClose() { closeNow() }
+
+    /// 민감 명령은 handshake 당시 인증뿐 아니라 현재 PIN epoch와도 일치해야 한다.
+    func isAuthorizedForSensitiveIntegration() -> Bool {
+        authorizationLock.lock()
+        let epoch = pairingAuthorizationEpoch
+        authorizationLock.unlock()
+        return pairing?.isCurrentAuthorization(epoch: epoch) == true
+    }
 
     func start() {
         connection.stateUpdateHandler = { [weak self] state in
@@ -135,6 +148,10 @@ final class HTTPWebSocketConnection {
         guard let requestLine = lines.first else { closeNow(); return }
         let parts = requestLine.split(separator: " ")
         guard parts.count >= 2 else { closeNow(); return }
+        guard parts[0] == "GET" else {
+            sendSimple(status: "405 Method Not Allowed", body: "Method Not Allowed")
+            return
+        }
         let path = String(parts[1])
 
         var headers: [String: String] = [:]
@@ -151,24 +168,64 @@ final class HTTPWebSocketConnection {
         if let pairing, pairing.enabled {
             let clean = path.split(separator: "?").first.map(String.init) ?? path
             if clean == "/pair" {
-                handlePair(path: path); return
+                handlePair(path: path, headers: headers); return
             }
             let token = Pairing.readCookie(headers["cookie"], name: Pairing.cookieName)
-            if !pairing.isAuthorized(cookieToken: token) {
+            guard let epoch = pairing.authorizedEpoch(cookieToken: token) else {
                 if isUpgrade { closeNow() } else { servePairPage(error: false) }
                 return
             }
+            authorizationLock.lock()
+            pairingAuthorizationEpoch = epoch
+            authorizationLock.unlock()
         }
 
         if isUpgrade, let key = headers["sec-websocket-key"] {
+            guard Self.isAllowedOrigin(origin: headers["origin"], hostHeader: headers["host"],
+                                       allowedHosts: allowedHosts) else {
+                sendSimple(status: "403 Forbidden", body: "Cross-origin WebSocket denied")
+                return
+            }
             performHandshake(key: key)
         } else {
             serveStatic(path: path)
         }
     }
 
+    /// same-origin에 더해 이 Mac이 광고하는 Host만 허용해 DNS rebinding도 차단한다.
+    private static func isAllowedOrigin(origin: String?, hostHeader: String?,
+                                        allowedHosts: Set<String>) -> Bool {
+        guard let origin, let hostHeader,
+              let originURL = URLComponents(string: origin),
+              let scheme = originURL.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              originURL.user == nil, originURL.password == nil,
+              originURL.path.isEmpty, originURL.query == nil, originURL.fragment == nil,
+              let rawOriginHost = originURL.host,
+              let requestURL = URLComponents(string: "\(scheme)://\(hostHeader)"),
+              requestURL.user == nil, requestURL.password == nil,
+              requestURL.path.isEmpty, requestURL.query == nil, requestURL.fragment == nil,
+              let rawRequestHost = requestURL.host else { return false }
+        let originHost = normalizedHost(rawOriginHost)
+        let requestHost = normalizedHost(rawRequestHost)
+        let defaultPort = scheme == "https" ? 443 : 80
+        let originPort = originURL.port ?? defaultPort
+        let requestPort = requestURL.port ?? defaultPort
+        // *.ts.net은 Tailscale이 소유·인증하는 tailnet HTTPS 이름이다. 노드 DNS 이름을
+        // 동기 CLI로 조회해 부팅을 막지 않으면서 Serve 프록시를 허용한다.
+        let trustedHost = allowedHosts.contains(requestHost) || requestHost.hasSuffix(".ts.net")
+        return originHost == requestHost && originPort == requestPort
+            && trustedHost
+    }
+
+    private static func normalizedHost(_ raw: String) -> String {
+        var host = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        while host.hasSuffix(".") { host.removeLast() }
+        return host
+    }
+
     /// `GET /pair?pin=######` 처리: 맞으면 쿠키 발급 후 "/" 로 리다이렉트, 틀리면 에러 페이지.
-    private func handlePair(path: String) {
+    private func handlePair(path: String, headers: [String: String]) {
         var pin: String?
         if let query = path.split(separator: "?").dropFirst().first {
             for field in query.split(separator: "&") {
@@ -178,12 +235,36 @@ final class HTTPWebSocketConnection {
                 }
             }
         }
-        if let pairing, pairing.verifyPin(pin) {
-            let cookie = "\(Pairing.cookieName)=\(pairing.currentToken()); Path=/; Max-Age=31536000; SameSite=Lax; HttpOnly"
+        if let pairing, pairing.verifyPin(pin, peer: peerIdentifier) {
+            let secure = requestUsesHTTPS(headers: headers) ? "; Secure" : ""
+            let cookie = "\(Pairing.cookieName)=\(pairing.currentToken()); Path=/; Max-Age=31536000; SameSite=Strict; HttpOnly\(secure)"
             let head = "HTTP/1.1 302 Found\r\nLocation: /\r\nSet-Cookie: \(cookie)\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             sendRaw(head)
         } else {
             servePairPage(error: true)
+        }
+    }
+
+    private func requestUsesHTTPS(headers: [String: String]) -> Bool {
+        if connection.metadata(definition: NWProtocolTLS.definition) != nil { return true }
+        if headers["x-forwarded-proto"]?.split(separator: ",").first?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "https" { return true }
+        for name in ["origin", "referer"] {
+            if let raw = headers[name], URLComponents(string: raw)?.scheme?.lowercased() == "https" {
+                return true
+            }
+        }
+        return false
+    }
+
+    private var peerIdentifier: String {
+        switch connection.endpoint {
+        case .hostPort(let host, _): return host.debugDescription
+        case .service(let name, _, let domain, _): return "\(name).\(domain)"
+        case .unix(let path): return path
+        case .url(let url): return url.host ?? url.absoluteString
+        case .opaque(let endpoint): return String(describing: endpoint)
+        @unknown default: return "unknown"
         }
     }
 
@@ -237,12 +318,21 @@ final class HTTPWebSocketConnection {
             + "Content-Type: \(item.mime)\r\n"
             + "Content-Length: \(item.data.count)\r\n"
             + "Cache-Control: no-store\r\n"
+            + "X-Content-Type-Options: nosniff\r\n"
+            + "X-Frame-Options: DENY\r\n"
+            + "Referrer-Policy: no-referrer\r\n"
             + "Connection: close\r\n\r\n"
         var response = Data(head.utf8)
         response.append(item.data)
         closing = true
         connection.send(content: response, completion: .contentProcessed { [weak self] _ in
-            self?.connection.cancel()
+            // ⚠️ 즉시 cancel() 금지: contentProcessed는 '스택이 접수'이지 '전송 완료'가 아니다.
+            // TLS+터널(테일스케일) 경로에서 큰 파일(app.js 135KB)의 꼬리가 잘려 iOS가
+            // 불완전한 JS를 받고 재시도만 반복했다 (루프백은 즉시 플러시라 재현 불가).
+            // Connection: close 계약상 클라이언트가 다 읽으면 먼저 닫는다 — 3초 유예 후 정리.
+            DispatchQueue.global().asyncAfter(deadline: .now() + 3) { [weak self] in
+                self?.connection.cancel()
+            }
         })
     }
 

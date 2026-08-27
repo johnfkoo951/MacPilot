@@ -1,96 +1,82 @@
-# CONNECTION — 폰에서 어떻게 닿는가, 안 될 때 무엇을 보는가
+# CONNECTION — 접속과 장애 점검
 
-> 설계 배경·대안 비교는 [CONNECTION_RESEARCH.md](CONNECTION_RESEARCH.md).
-> 이 문서는 **운영 런북**이다: 지금 어떤 경로로 서비스되고 있고, 끊겼을 때 어디부터 보는가.
+> 설계 배경은 [CONNECTION_RESEARCH.md](CONNECTION_RESEARCH.md), 프로세스 관리는
+> [SERVER.md](../SERVER.md)를 참고하세요. 이 문서의 주소는 모두 공개용 예시입니다.
 
-## 지금 쓰는 경로
+## 지원 경로
 
-```
-폰 (Tailscale ON)
-  │  https://pilot.cmdspace.work
-  │  DNS A레코드 = 이 맥의 Tailscale IP (100.x.x.x, CGNAT 대역)
-  ▼
-CmdPilot Helper (:443)  ← Let's Encrypt 인증서로 앱이 직접 TLS 종단
-  │  App Support/CmdPilot/tls/pilot.p12  (acme.sh 발급, 갱신 훅이 헬퍼 재시작)
-  ├─ :8766  평문 HTTP/WebSocket (LAN·로컬)
-  └─ :80    평문 (리다이렉트/LAN)
-```
+| 경로 | 예시 | 용도 |
+|---|---|---|
+| 같은 LAN | `http://<mac-name>.local:8766` | 기본 트랙패드·키보드·덱 |
+| Tailscale Serve | `https://<mac-name>.<tailnet>.ts.net` | private tailnet 원격 + iOS secure context |
+| 자체 TLS(선택) | `https://control.example.com` | 앱의 선택적 `:443` 리스너 |
 
-| 항목 | 값 |
-|---|---|
-| 주소 | `https://pilot.cmdspace.work` |
-| 도달 조건 | **폰에 Tailscale이 켜져 있을 것** (tailnet 전용 — 공개 인터넷에 열려 있지 않다) |
-| 인증서 | acme.sh → Let's Encrypt, `~/.acme.sh/pilot.cmdspace.work_ecc/` |
-| 왜 HTTPS인가 | iOS는 DeviceMotion/Orientation을 secure context에서만 허용 — 에어마우스가 HTTPS를 요구한다 |
-| 앱 인증 | **없음**. 방어선은 네트워크 계층(tailnet 신원)이다 |
+CmdPilot은 원격 입력을 주입하므로 인터넷에 포트포워딩하거나 Tailscale Funnel로 공개하지 마세요.
+공용 Wi‑Fi나 선택적 세션 통합을 사용할 때는 메뉴바에서 PIN 페어링을 켜야 합니다.
 
-`https://<맥이름>.<tailnet>.ts.net` (tailscale serve) 경로도 대안으로 있으나
-현재 serve 설정은 비어 있고, 커스텀 도메인 + 앱 :443이 생산 경로다.
-
-## 안 될 때 — 순서대로
-
-### 0. 맥에서 자기 Tailscale IP로 테스트하지 말 것 (오탐)
+## 기본 상태 확인
 
 ```bash
-curl https://100.125.183.54        # ← 실패해도 정상. 하이핀 불가.
-tailscale ping 100.125.183.54      # → "is local Tailscale IP"
+./script/macpilotctl.sh status
+bash script/watchdog.sh check
+curl --fail --silent --show-error http://127.0.0.1:8766/ >/dev/null
 ```
-Tailscale은 자기 자신의 tailnet 주소로 도는 트래픽을 루프백하지 않는다.
-맥에서 서버 건강을 확인하려면 **loopback + 올바른 호스트명(SNI)** 으로:
+
+프로세스는 살아 있어도 HTTP 응답이 멈출 수 있습니다. 로컬 probe가 실패하면:
 
 ```bash
-curl -s -o /dev/null -w '%{http_code} · TLS %{ssl_verify_result}\n' \
-  --resolve pilot.cmdspace.work:443:127.0.0.1 https://pilot.cmdspace.work
-# 기대: 200 · TLS 0
+./script/macpilotctl.sh restart
+tail -n 50 "$HOME/Library/Logs/CmdPilot/watchdog.log"
 ```
 
-### 1. 헬퍼가 "살아 있는데 서빙은 안 하는" 상태인가 ← 실제로 물린 사례
+## LAN에서 안 될 때
+
+- Mac과 폰이 같은 Wi‑Fi에 있고 Mac이 깨어 있는지 확인합니다.
+- 메뉴바의 `.local` 주소와 IPv4 대체 주소를 각각 시도합니다.
+- macOS 방화벽에서 `CmdPilot Helper`의 수신 연결이 허용됐는지 확인합니다.
+- 입력만 안 되면 시스템 설정의 손쉬운 사용 권한을 확인합니다.
+- 미러/캡처만 안 되면 화면 기록 권한을 별도로 확인합니다.
+
+## Tailscale에서 안 될 때
 
 ```bash
-bash script/watchdog.sh check      # 🟢/🔴 한 줄
-./script/macpilotctl.sh status     # HTTP: ok / unavailable
+tailscale status
+tailscale serve status
+tailscale ip -4
 ```
 
-2026-08-10에 헬퍼가 **34시간 동안** 8766·80·443 소켓을 쥔 채 accept를 하지
-않았다. 프로세스는 살아 있었으므로 LaunchAgent `KeepAlive`는 개입하지 않았고
-(keepalive는 '프로세스 존재'만 본다), 폰에서는 그냥 접속이 안 됐다.
-로컬 `curl 127.0.0.1:8766`도 실패한다는 것이 결정적 증거다 — 네트워크가
-아니라 프로세스 문제라는 뜻.
+Mac 자체 Tailscale IP를 같은 Mac에서 curl하는 self-hairpin 검사는 환경에 따라 실패할 수 있습니다.
+애플리케이션 건강은 loopback으로, peer 도달성은 다른 tailnet 기기에서 확인하세요.
+
+## 자체 TLS(선택)
+
+내장 PKCS#12 HTTPS는 macOS 15 이상에서만 지원합니다. macOS 13–14에서는 위의 private
+Tailscale Serve 경로를 사용하세요.
+
+1. 인증서 CN/SAN이 가리키는 이름을 private network에서만 Mac으로 해석되게 합니다.
+2. `pilot.p12`와 `pilot.cer`를 `~/Library/Application Support/CmdPilot/tls/`에 둡니다.
+3. 암호를 Keychain에 저장하고 헬퍼를 재시작합니다.
 
 ```bash
-./script/macpilotctl.sh restart    # 수동 복구
+./script/configure-secrets.sh tls
+./script/macpilotctl.sh restart
+
+host="control.example.com"
+curl --fail --resolve "$host:443:127.0.0.1" "https://$host/" >/dev/null
 ```
 
-**자동 복구**: `script/watchdog.sh`가 5분마다 로컬 HTTP를 찔러 무응답이면
-재시작하고 OmniControl 브리핑으로 알린다. 등록은 OmniControl 스케줄러가 한다
-(스케줄러를 한 벌로 유지):
+인증서와 개인키, PKCS#12 암호, 실제 도메인·tailnet 주소는 저장소에 커밋하지 않습니다.
+
+## 선택적 로컬 에이전트 통합
+
+세션 검색·원격 결정 기능은 공개 기본값에서 비활성이고 PIN 페어링이 필수입니다. 앱 설치 후
+loopback endpoint와 토큰을 로컬 설정/Keychain에 등록합니다.
 
 ```bash
-cmux-voice schedule status cmdpilot-watchdog
-cmux-voice schedule logs   cmdpilot-watchdog
-tail ~/Library/Logs/CmdPilot/watchdog.log    # 재시작 이력
+./script/configure-secrets.sh omni http://127.0.0.1:8765
+./script/macpilotctl.sh restart
 ```
 
-### 2. 폰 쪽
-
-- 폰의 **Tailscale이 켜져 있는가** (셀룰러여도 tailnet이면 된다)
-- `tailscale status`에 폰이 보이는가: `tailscale status | grep -i iphone`
-- 폰 브라우저 캐시 — 주소창에 직접 입력해 볼 것
-
-### 3. 인증서 만료
-
-```bash
-openssl x509 -in ~/.acme.sh/pilot.cmdspace.work_ecc/fullchain.cer -noout -enddate
-```
-만료가 임박하면 acme.sh가 갱신하고 훅이 헬퍼를 재시작한다. 갱신 후에도
-443이 옛 인증서를 물고 있으면 헬퍼 재시작.
-
-### 4. 맥이 자거나 lid가 닫혔는가
-
-헬퍼는 맥이 깨어 있을 때만 서빙한다. 원격에서 계속 필요하면 카페인/전원 설정.
-
-## 관련
-
-- OmniControl `config.mobile_url` — needs_input/error Telegram 메시지에 이 주소를
-  붙여 "푸시 → 탭 → 승인" 루프를 만든다. 주소가 바뀌면 거기도 같이 바꿀 것.
-- OmniControl `cmux-voice doctor` — 모바일 경로(로컬 헬퍼) 점검 1행 포함.
+토큰은 브라우저에 전달되지 않으며 `integrations.plist`에는 loopback URL만 기록됩니다.
+로컬 서비스 요청은 시스템 proxy/PAC를 쓰지 않고 HTTP redirect도 따르지 않아 토큰이 다른 주소로
+전달되지 않습니다.

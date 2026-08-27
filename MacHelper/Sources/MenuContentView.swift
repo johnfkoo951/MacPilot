@@ -210,7 +210,7 @@ struct MenuContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(CMDSBrand.pink)
                 .controlSize(.small)
-                .help("손쉬운 사용 설정 열기 — 재빌드(ad-hoc 서명) 후에는 다시 켜야 합니다")
+                .help("손쉬운 사용 설정 열기 — ad-hoc 서명으로 재빌드한 경우 다시 켜야 합니다")
             }
         }
         .panelStyle()

@@ -9,7 +9,7 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "0.4.0"
+    MARKETING_VERSION: "0.5.1"
     CURRENT_PROJECT_VERSION: "1"
     CODE_SIGN_STYLE: Automatic
     DEVELOPMENT_TEAM: ""   # ← Xcode > Signing 에서 본인 Apple 팀 선택 / set your own Apple Team here
@@ -35,6 +35,8 @@ targets:
       properties:
         CFBundleDisplayName: "CmdPilot Helper"
         CFBundleIconFile: AppIcon
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         LSUIElement: true
         NSLocalNetworkUsageDescription: "아이폰과 같은 Wi-Fi에서 브라우저 연결을 받기 위해 로컬 네트워크를 사용합니다."
 

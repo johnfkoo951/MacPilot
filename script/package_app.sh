@@ -16,28 +16,36 @@ VERSION=${VERSION:-0.0.0}
 
 echo "▸ 프로젝트 생성 + Release 빌드(서명 없이)…  (v$VERSION)"
 xcodegen generate >/dev/null
-xcodebuild -project CmdPilot.xcodeproj -scheme CmdPilotHelper -configuration Release \
+./script/xcodebuild-clean.sh -project CmdPilot.xcodeproj -scheme CmdPilotHelper -configuration Release \
   -derivedDataPath ./.release CODE_SIGNING_ALLOWED=NO build >/dev/null
 
 APP_SRC="./.release/Build/Products/Release/$APP_NAME.app"
 
-# 서명: 고정 인증서 우선(배포본 안정), 없으면 ad-hoc.
-CERT=""
-for attempt in 1 2 3 4; do
-  CERT=$(security find-identity -v -p codesigning 2>/dev/null | grep -E "Apple Development|CmdSpace Local Signing" | head -1 | awk '{print $2}')
-  [ -n "$CERT" ] && break
-  sleep 1
-done
-if [ -n "$CERT" ] && codesign --force --deep --sign "$CERT" "$APP_SRC" >/dev/null 2>&1 \
-   && codesign -dvv "$APP_SRC" 2>&1 | grep -qE "Apple Development|CmdSpace Local Signing"; then
-  echo "▸ 고정 인증서 서명 OK ($CERT)"
+# 서명: deploy.sh와 동일하게 명시값 → Apple Development → 유일 identity 순서.
+if ! CERT="$(./script/select-codesign-identity.sh)"; then
+  exit 1
+fi
+if [ -n "$CERT" ]; then
+  if ! codesign --force --deep --sign "$CERT" "$APP_SRC" >/dev/null 2>&1 \
+     || ! codesign --verify --deep --strict "$APP_SRC" >/dev/null 2>&1; then
+    echo "  ❌ 코드 서명 실패 ($CERT). ad-hoc으로 자동 강등하지 않습니다." >&2
+    exit 1
+  fi
+  echo "▸ 고정 identity 서명 OK ($CERT)"
 else
+  if [ "${ALLOW_ADHOC_SIGNING:-0}" != "1" ]; then
+    echo "  ❌ 유효한 코드 서명 identity가 없습니다." >&2
+    echo "     CODESIGN_IDENTITY를 지정하거나 ALLOW_ADHOC_SIGNING=1을 명시하세요." >&2
+    exit 1
+  fi
   codesign --force --deep --sign - "$APP_SRC" >/dev/null 2>&1
-  echo "  ⚠️  고정 인증서 없음 → ad-hoc 서명(배포본 Gatekeeper 경고 가능)."
+  echo "  ⚠️  고정 identity 없음 → ad-hoc 서명(Gatekeeper 경고, Keychain ACL 연속성 없음)."
 fi
 
 echo "▸ dist/ 패키징…"
-rm -rf "$OUT"
+if [ -e "$OUT" ]; then
+  find "$OUT" -depth -delete
+fi
 mkdir -p "$OUT"
 ditto "$APP_SRC" "$OUT/$DIST_NAME.app"
 # 리소스 포크/확장속성 없는 배포용 zip — 버전 없는 최신본 + 버전 박힌 릴리즈 에셋

@@ -6,6 +6,11 @@
   const dot = document.getElementById("dot");
   let ws = null, reconnectTimer = null;
   let latencyMs = null, pingTimer = null;
+  let reauthRequested = false, coreAuthorized = false, sensitiveAuthorized = false;
+  const SENSITIVE_RESPONSE_TYPES = new Set([
+    "cmux", "cmuxStatuses", "ctermGrid", "csessRead",
+    "omniState", "omniSearch", "omniFocus", "omniPtt",
+  ]);
   const pendingPings = new Map();
   let networkUIRefresh = null;   // 설정 모달이 열려 있을 때 자동 프리셋 변경을 반영
 
@@ -15,18 +20,56 @@
     ws = new WebSocket(`${proto}://${location.host}/ws`);
     ws.binaryType = "arraybuffer";
     ws.onopen = () => {
+      reauthRequested = false;
+      coreAuthorized = false;
+      sensitiveAuthorized = false;
       setStatus(true);
       send({ t: "hello", name: "Safari" });
-      send({ t: "getDeck" });
       startPing();
+      if (currentTab === "agent") startCmuxPoll();
+      if (currentTab === "term") startTermPoll();
+      if (currentTab === "search") srchGo();
       if (mirror.active) startMirror();   // 재연결 시 미러 자동 재개
     };
-    ws.onclose = () => { stopPing(); setStatus(false); scheduleReconnect(); };
+    ws.onclose = () => {
+      coreAuthorized = false;
+      stopPing(); clearSensitiveSessionData(); setStatus(false);
+      if (!reauthRequested) scheduleReconnect();
+    };
     ws.onerror = () => { try { ws.close(); } catch (e) {} };
     ws.onmessage = (ev) => {
-      if (ev.data instanceof ArrayBuffer) { onMirrorFrame(ev.data); return; }   // 미러 영상 프레임
+      if (ev.data instanceof ArrayBuffer) {
+        if (coreAuthorized) onMirrorFrame(ev.data);
+        return;
+      }   // 미러 영상 프레임
       try {
         const m = JSON.parse(ev.data);
+        // 서버가 보낸 최초 인증 봉투를 받은 뒤에만 응답을 반영한다. PIN 변경 직전
+        // 시작된 비동기 요청이 늦게 도착해 폐기한 화면을 다시 채우는 것을 막는다.
+        if (m.t === "security") {
+          if (m.core === "authorized" && m.pairing === "authorized") {
+            coreAuthorized = true;
+            sensitiveAuthorized = true;
+            restoreSensitiveSessionData();
+            send({ t: "getDeck" });
+          } else if (m.core === "authorized" && m.pairing === "disabled") {
+            coreAuthorized = true;
+            clearSensitiveSessionData();
+            send({ t: "getDeck" });
+          } else if (m.required === "pairing") {
+            clearSensitiveSessionData();
+            toast("세션 기능을 사용하려면 Mac 메뉴에서 PIN 페어링을 켜세요");
+          } else if (m.required === "reload") {
+            reauthRequested = true;
+            coreAuthorized = false;
+            clearSensitiveSessionData();
+            setStatus(false);
+            setTimeout(() => location.reload(), 60);
+          }
+          return;
+        }
+        if (!coreAuthorized) return;
+        if (SENSITIVE_RESPONSE_TYPES.has(m.t) && !sensitiveAuthorized) return;
         if (m.t === "deck") {
           if (m.json && m.json.folders) { deck = m.json; saveLocal(); renderDeck(); }
           else { pushDeckToServer(); }   // 서버에 덱 없음 → 현재 덱으로 시드
@@ -56,8 +99,36 @@
           if (m.backend === "herdr") {       // herdr 탭으로 라우팅
             if (snapshot !== lastHerdrJSON) { lastHerdrJSON = snapshot; herdrState = m; renderHerdr(); }
           } else if (snapshot !== lastCmuxJSON) {   // cmux(기본) — 변경 없으면 리렌더 생략
-            lastCmuxJSON = snapshot; cmuxState = m; renderCmux();
+            lastCmuxJSON = snapshot; cmuxState = m; renderCmux(); renderSessCards();
+            lastLiveAt = Date.now();
+            omniCache.cmux = m; omniCache.ts = Date.now(); saveCacheSoon();
+            prefetchScreens();
           }
+        } else if (m.t === "omniSearch") {
+          renderSearch(m);
+        } else if (m.t === "omniFocus") {
+          document.querySelectorAll(".srch-row.busy").forEach((b) => b.classList.remove("busy"));
+          toast(m.ok ? "맥에서 열었습니다 ✓" : "열기 실패 — 데몬/cmux 상태 확인");
+        } else if (m.t === "omniPtt") {
+          handleOmniPttAck(m);
+        } else if (m.t === "cmuxStatuses") {
+          // 카드 워크스페이스들의 사이드바 필(결정 힌트·사분면·Running) — 지연 조회 응답
+          const snap = JSON.stringify(m.statuses || {});
+          if (snap !== lastStatusesJSON) {
+            lastStatusesJSON = snap; wsStatuses = m.statuses || {};
+            lastCardsSig = ""; renderSessCards();
+          }
+        } else if (m.t === "omniState") {
+          const snap = JSON.stringify(m);
+          if (snap !== lastOmniJSON) {
+            lastOmniJSON = snap; omniState = m; renderSessCards();
+            renderPttBanner(); renderVoicePill();
+            lastLiveAt = Date.now();
+            omniCache.omni = m; omniCache.ts = Date.now(); saveCacheSoon();
+            prefetchScreens();
+          }
+        } else if (m.t === "csessRead") {
+          onSessRead(m);
         } else if (m.t === "capture") {
           const capBox = document.getElementById("cap-result");
           if (capBox) capBox.innerHTML = m.data
@@ -84,7 +155,10 @@
   }
   function scheduleReconnect() { clearTimeout(reconnectTimer); reconnectTimer = setTimeout(connect, 1000); }
   function setStatus(ok) {
-    statusEl.textContent = ok ? ("연결됨" + (latencyMs ? " · " + latencyMs + "ms" : "")) : "연결 끊김 · 재시도 중…";
+    statusEl.textContent = ok
+      ? ("연결됨" + (latencyMs ? " · " + latencyMs + "ms" : ""))
+      : (reauthRequested ? "PIN 재인증 중…" : "연결 끊김 · 탭하여 새로고침");
+    statusEl.onclick = ok ? null : () => location.reload();
     dot.className = "dot" + (ok ? " on" : "");
   }
   function send(obj) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); }
@@ -134,7 +208,9 @@
     sheetOpenPos: 0,    // 마지막으로 열어둔 높이
     layoutMode: "auto", // 화면 모드: auto(폭 기준) | phone | tablet
     dockSplit: 0.42,    // 도킹 시 컴패니언(트랙패드/키보드)이 차지하는 비율(0.3~0.72).
-    dockCompanion: "trackpad"   // 도킹 컴패니언 슬롯: "trackpad" | "keyboard" | "none"
+    dockCompanion: "trackpad",  // 도킹 컴패니언 슬롯: "trackpad" | "keyboard" | "none"
+    vaultPrimary: "",           // 개인 볼트명은 기기 localStorage에만 저장
+    vaultSecondary: ""
   };
   const NETWORK_PRESETS = {
     auto: { label: "자동" },   // RTT 기반 — 아래 AUTO_TIERS 로 실시간 조정
@@ -467,6 +543,12 @@
     // 터미널 탭: 소프트키보드는 자동으로 안 띄운다(들어가자마자 키보드가 화면을 밀어올리던 문제).
     // 입력하려면 화면/입력창을 탭하면 포커스됨. 물리 키보드가 붙어 있을 때만 자동 포커스.
     if (name === "term") { wireTerm(); startTermPoll(); if (HW.present) focusTermTarget(); } else stopTermPoll();
+    // 검색 탭: 최근 질의 칩 + 현재 뷰 로드. 소프트키보드는 자동으로 안 띄움(터미널 탭과 동일 원칙).
+    if (name === "search") {
+      if (sensitiveAuthorized) renderSrchRecent();
+      srchGo();
+      if (HW.present) setTimeout(() => document.getElementById("srch-input")?.focus(), 50);
+    }
     if (document.documentElement.classList.contains("docked")) applyDockCompanion();   // 활성 패널 변경 시 키보드 컴패니언 중복 회피
   }
   document.querySelectorAll("#tabbar .tab").forEach((tab) => {
@@ -874,7 +956,13 @@
         { type: "key", keyCode: 36, mods: [] }
       ] });
     } else if (act === "launch") {
-      send({ t: "launch", target: b.dataset.target || "" });
+      let target = b.dataset.target || "";
+      if (b.dataset.vaultSlot) {
+        const key = b.dataset.vaultSlot === "secondary" ? "vaultSecondary" : "vaultPrimary";
+        const vault = String(settings[key] || "").trim();
+        target = vault ? "obsidian://open?vault=" + encodeURIComponent(vault) : "obsidian://open";
+      }
+      send({ t: "launch", target });
     } else if (act === "window") {
       send({ t: "window", dir: b.dataset.dir || "next" });   // AX 직접 창 전환(키 입력 없음)
     } else if (act === "capmenu") {
@@ -883,6 +971,64 @@
   }
   document.querySelectorAll("#panel-agent .agent-btn, #quickbar button, #quickbar2 button").forEach((b) => {
     b.addEventListener("click", () => runQuickAction(b));
+  });
+
+  // ═════════ 빠른 지시 — 일반적인 에이전트 작업 흐름 기본값 + 사용자 편집 ═════════
+  const QP_DEFAULT = [
+    "진행해", "현재 상태는?",
+    "응 해줘", "커밋하고 푸시해줘",
+    "지금까지 진행상황 요약해줘", "배포해줘",
+    "/compact", "/clear",
+  ];
+  let quickPhrases = (() => {
+    try {
+      const v = JSON.parse(localStorage.getItem("quickPhrases.v1"));
+      return Array.isArray(v) && v.length ? v : QP_DEFAULT.slice();
+    } catch (e) { return QP_DEFAULT.slice(); }
+  })();
+  function renderQuickPhrases() {
+    const box = document.getElementById("quick-phrases");
+    if (!box) return;
+    box.innerHTML = "";
+    quickPhrases.forEach((text) => {
+      const b = document.createElement("button");
+      b.className = "agent-btn ph";
+      b.dataset.act = "phrase"; b.dataset.text = text;
+      b.textContent = text.length > 14 ? text.slice(0, 13) + "…" : text;
+      b.title = text;
+      b.addEventListener("click", () => { buzz(); runQuickAction(b); });
+      box.appendChild(b);
+    });
+  }
+  renderQuickPhrases();
+  document.getElementById("qp-edit")?.addEventListener("click", () => {
+    buzz();
+    modalRoot.innerHTML =
+      '<div class="modal-bg"></div><div class="modal-card">' +
+      '<div class="modal-head"><div class="modal-title">빠른 지시 편집</div><button id="qp-close" class="modal-x">✕</button></div>' +
+      '<div class="ed-label">한 줄에 하나 — 버튼을 누르면 그대로 타이핑 후 ⏎ 전송됩니다</div>' +
+      '<textarea id="qp-text" class="ed-input" style="min-height:180px"></textarea>' +
+      '<div class="modal-actions">' +
+        '<button id="qp-save" class="primary">저장</button>' +
+        '<button id="qp-reset">기본값 복원</button>' +
+      '</div></div>';
+    const ta = document.getElementById("qp-text");
+    ta.value = quickPhrases.join("\n");
+    const close = () => { modalRoot.innerHTML = ""; };
+    document.getElementById("qp-close").addEventListener("click", close);
+    modalRoot.querySelector(".modal-bg").addEventListener("click", close);
+    document.getElementById("qp-reset").addEventListener("click", () => {
+      ta.value = QP_DEFAULT.join("\n");
+    });
+    document.getElementById("qp-save").addEventListener("click", () => {
+      const list = ta.value.split("\n").map((s) => s.trim()).filter(Boolean).slice(0, 16);
+      if (list.length) {
+        quickPhrases = list;
+        try { localStorage.setItem("quickPhrases.v1", JSON.stringify(list)); } catch (e) {}
+        renderQuickPhrases();
+      }
+      close(); toast("빠른 지시 " + list.length + "개 저장됨");
+    });
   });
 
   // ═════════ 캡처 메뉴 (양방향) ═════════
@@ -949,7 +1095,10 @@
   });
 
   // ═════════ 화면 미러 (맥 화면 실시간 + 탭→클릭) ═════════
-  const mirror = { canvas: null, ctx: null, dispW: 0, dispH: 0, pending: null, decoding: false, active: false, display: null };
+  const mirror = {
+    canvas: null, ctx: null, dispW: 0, dispH: 0, pending: null,
+    decoding: false, active: false, display: null, generation: 0,
+  };
   // 미러 로컬 뷰(맥에 안 보냄 — 캔버스 CSS transform 전용). scale 1~5, tx/ty px.
   const mirrorView = { scale: 1, tx: 0, ty: 0 };
   const MIRROR_ZOOM_MAX = 5;
@@ -1055,8 +1204,10 @@
     mirror.decoding = true;
     while (mirror.pending) {
       const blob = mirror.pending; mirror.pending = null;
+      const generation = mirror.generation;
       try {
         const bmp = await createImageBitmap(blob);      // 오프-메인 디코드
+        if (generation !== mirror.generation) { bmp.close(); continue; }
         if (mirror.canvas.width !== bmp.width) { mirror.canvas.width = bmp.width; mirror.canvas.height = bmp.height; }
         mirror.ctx.drawImage(bmp, 0, 0);
         bmp.close();
@@ -1259,12 +1410,11 @@
   // ═════════ cmux 터미널 뷰 (포커스된 터미널 화면 텍스트 + 입력) ═════════
   const term = { active: false, poll: null, lastSig: "" };
   function esc(s) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
-  function renderTermGrid(g) {
-    const screen = document.getElementById("term-screen");
-    if (!screen) return;
+  /// 렌더 그리드 → {html, bg} — 터미널 탭과 세션 시트가 공유하는 컬러 렌더러.
+  function gridToHTML(g) {
     const styles = {};
     (g.styles || []).forEach((s) => { styles[s.id] = s; });
-    const rows = g.rows || 24, cols = g.columns || 80;
+    const rows = g.rows || 24;
     const byRow = {};
     (g.row_spans || []).forEach((sp) => { (byRow[sp.row] = byRow[sp.row] || []).push(sp); });
     let html = "";
@@ -1286,10 +1436,15 @@
       }
       html += "<div class='tline'>" + (line || "&nbsp;") + "</div>";
     }
-    // 배경색을 style 0 기준으로
-    const bg = (styles[0] && styles[0].background) || "#1a1c23";
-    screen.style.background = bg;
-    screen.innerHTML = html;
+    return { html, bg: (styles[0] && styles[0].background) || "#1a1c23" };
+  }
+
+  function renderTermGrid(g) {
+    const screen = document.getElementById("term-screen");
+    if (!screen) return;
+    const out = gridToHTML(g);
+    screen.style.background = out.bg;
+    screen.innerHTML = out.html;
     screen.scrollTop = screen.scrollHeight;   // 항상 최신 줄로
   }
   function requestTermGrid() { send({ t: "cterm", backend: currentBackend, action: "grid" }); }
@@ -1380,10 +1535,21 @@
     document.querySelectorAll("#term-switch button").forEach((b) => b.classList.toggle("on", b.dataset.tbk === id));
     if (term.active) requestTermGrid();
   }
+  // 카드 워크스페이스 사이드바 필 조회 — list-status가 ws당 ~0.4s라 20초 스로틀 + 카드 ws만
+  let wsStatuses = {}, lastStatusesJSON = "", lastStatusReq = 0;
+  function requestStatuses() {
+    if (Date.now() - lastStatusReq < 20000) return;
+    const ids = [...new Set(sessAttention().map((c) => c.ws).filter(Boolean))].slice(0, 6);
+    if (!ids.length) return;
+    lastStatusReq = Date.now();
+    send({ t: "cmux", backend: "cmux", dir: "statuses", target: ids.join(",") });
+  }
   function startCmuxPoll() {
     stopCmuxPoll();
-    requestCmux();
-    cmuxPoll = setInterval(() => { if (document.visibilityState === "visible") requestCmux(); }, 4000);
+    requestCmux(); requestOmni();
+    cmuxPoll = setInterval(() => {
+      if (document.visibilityState === "visible") { requestCmux(); requestOmni(); requestStatuses(); }
+    }, 4000);
   }
   function stopCmuxPoll() { if (cmuxPoll) clearInterval(cmuxPoll); cmuxPoll = null; }
   function cmuxChip(label, on, color, handler) {
@@ -1394,9 +1560,33 @@
     b.addEventListener("click", () => { buzz(); handler(); });
     return b;
   }
+  // ⑤ 에이전트 알림 ("지금 나를 기다리는 세션") — cmux notifications[] 렌더.
+  const NOTIF_LABEL = { waiting: "대기", permission: "승인", completed: "완료", other: "" };
+  function relTime(iso) {
+    const t = Date.parse(iso || ""); if (!t) return "";
+    const s = Math.max(0, (Date.now() - t) / 1000);
+    if (s < 60) return "방금"; if (s < 3600) return Math.floor(s / 60) + "분 전";
+    if (s < 86400) return Math.floor(s / 3600) + "시간 전"; return Math.floor(s / 86400) + "일 전";
+  }
+  function cmuxNotifRow(n) {
+    const row = document.createElement("button");
+    row.className = "notif-row cat-" + (n.cat || "other") + (n.read ? "" : " unread");
+    const dot = document.createElement("span"); dot.className = "notif-dot";
+    const main = document.createElement("span"); main.className = "notif-main";
+    const ws = document.createElement("span"); ws.className = "notif-ws"; ws.textContent = n.wsTitle || "세션";
+    const cat = document.createElement("span"); cat.className = "notif-cat st-" + (n.cat || "other");
+    cat.textContent = NOTIF_LABEL[n.cat] || "";
+    main.appendChild(ws); main.appendChild(cat);
+    const time = document.createElement("span"); time.className = "notif-time"; time.textContent = relTime(n.ts);
+    row.appendChild(dot); row.appendChild(main); row.appendChild(time);
+    // 탭 → 그 세션으로 포커스 + cmux 알림 읽음처리(open-notification) → 다음 폴에서 목록에서 빠짐.
+    row.addEventListener("click", () => { buzz(); requestCmux("open-notif", n.id); });
+    return row;
+  }
   function renderCmux() {
     const root = document.getElementById("cmux-remote");
     if (!root) return;
+    if (uiQuiet()) { lastCmuxJSON = ""; return; }   // 조작 중 정지 — 끝나면 다음 폴에서 갱신
     if (!cmuxState) { root.innerHTML = '<div class="cmux-empty">에이전트 상태 불러오는 중…</div>'; return; }
     if (cmuxState.available === false) {
       root.innerHTML = '<div class="cmux-empty">' + (cmuxState.backend || "백엔드") + '가 설치/설정되어 있지 않습니다</div>'; return;
@@ -1408,6 +1598,17 @@
       root.innerHTML = '<div class="cmux-empty">' + msg + '</div>'; return;
     }
     root.innerHTML = "";
+    const notifs = cmuxState.notifications || [];
+    if (notifs.length) {
+      const lbl = document.createElement("div");
+      lbl.className = "cmux-sub notif-head";
+      lbl.textContent = "⏳ 나를 기다리는 세션 (" + notifs.length + ")";
+      root.appendChild(lbl);
+      const list = document.createElement("div");
+      list.className = "notif-list";
+      notifs.forEach((n) => list.appendChild(cmuxNotifRow(n)));
+      root.appendChild(list);
+    }
     (cmuxState.windows || []).forEach((win) => {
       const row = document.createElement("div");
       row.className = "cmux-row";
@@ -1443,7 +1644,783 @@
       root.appendChild(wrap);
     }
   }
-  document.getElementById("cmux-refresh").addEventListener("click", () => { buzz(); requestCmux(); });
+  document.getElementById("cmux-refresh").addEventListener("click", () => { buzz(); requestCmux(); requestOmni(); });
+
+  // ═════════ 대기 결정 카드 + 세션 상세 시트 ═════════
+  // OmniControl pending(요약 headline 보유) + cmux notifications(수신함) + sessions(전체 탭)를
+  // 워크스페이스 키로 병합. "지금 나를 기다리는 세션"만 카드로 — 나머지는 아래 칩 UI가 담당.
+  let omniState = null, lastOmniJSON = "";
+  function requestOmni() { send({ t: "omni" }); }
+
+  /// cmux sessions[]에서 워크스페이스/탭 제목·색·그룹 룩업을 만든다 — 카드의 세션 구분 정보원.
+  function sessLookups() {
+    const wsTitle = new Map(), tabTitle = new Map(), wsColor = new Map(), wsGroup = new Map();
+    ((cmuxState && cmuxState.sessions) || []).forEach((w) => {
+      if (w.id) {
+        wsTitle.set(w.id, w.title || "");
+        if (w.color) wsColor.set(w.id, w.color);
+        if (w.group) wsGroup.set(w.id, w.group);
+      }
+      (w.terminals || []).forEach((t) => { if (t.id) tabTitle.set(t.id, t.title || ""); });
+    });
+    // windows[].workspaces[]에도 색이 있다 — sessions에 색이 비면 폴백.
+    ((cmuxState && cmuxState.windows) || []).forEach((win) => {
+      (win.workspaces || []).forEach((ws) => {
+        if (ws.id && ws.color && !wsColor.has(ws.id)) wsColor.set(ws.id, ws.color);
+      });
+    });
+    return { wsTitle, tabTitle, wsColor, wsGroup };
+  }
+
+  /// SF Symbol 이름 → 이모지 근사 (필 아이콘 렌더용, 모르면 ●)
+  function pillIcon(sf) {
+    if (!sf) return "●";
+    if (sf.startsWith("questionmark")) return "💬";
+    if (sf.startsWith("exclamationmark")) return "⚠️";
+    if (sf.startsWith("bolt")) return "⚡";
+    if (sf.startsWith("calendar")) return "📅";
+    if (sf.startsWith("checkmark")) return "✓";
+    if (sf.startsWith("moon") || sf.startsWith("zzz")) return "💤";
+    return "●";
+  }
+
+  /// 카드 목록 계산 — 오래 기다린 세션이 위 (결정 부채가 큰 순).
+  /// 키는 surface(탭) 우선 — 같은 워크스페이스의 다른 탭 세션들을 각각의 카드로 구분한다.
+  function sessAttention() {
+    const cards = new Map();   // surface || ws || session → card
+    const keyOf = (surface, ws, sid) => surface || ws || ("sess:" + sid);
+    const notifs = (cmuxState && cmuxState.notifications) || [];
+    notifs.forEach((n) => {
+      if (n.cat !== "waiting" && n.cat !== "permission") return;
+      const key = keyOf(n.surface, n.ws, n.id);
+      if (cards.has(key)) return;   // CLI가 최신순 → 첫 항목이 대표
+      cards.set(key, {
+        ws: n.ws || "", surface: n.surface || "", title: n.wsTitle || "세션",
+        cat: n.cat, headline: n.body || "", ts: Date.parse(n.ts) / 1000 || 0,
+      });
+    });
+    const pending = (omniState && omniState.available && omniState.state
+                     && omniState.state.pending) || [];
+    pending.forEach((p) => {
+      const key = keyOf(p.surface, p.workspace, p.session);
+      const prev = cards.get(key);
+      if (prev) {   // omni 요약이 있으면 headline을 더 좋은 것으로 교체
+        if (p.headline) prev.headline = p.headline;
+        if (p.ts) prev.ts = Math.min(prev.ts || p.ts, p.ts);
+        prev.label = p.label; prev.cwd = p.cwd || "";
+        prev.decisions = p.decisions || [];
+        if (!prev.surface && p.surface) prev.surface = p.surface;
+      } else {
+        cards.set(key, {
+          ws: p.workspace || "", surface: p.surface || "", title: p.label || "세션",
+          cat: "waiting", headline: p.headline || "", ts: p.ts || 0,
+          label: p.label, cwd: p.cwd || "", decisions: p.decisions || [],
+        });
+      }
+    });
+    return [...cards.values()].sort((a, b) => (b.ts || 0) - (a.ts || 0));   // 최신이 맨 위
+  }
+
+  // ── 세션 캐시: 같은 탭 새로고침 직후 마지막 상태로 그리기(stale-while-revalidate) ──
+  // 카드·세션 화면·작성 중 프롬프트는 민감할 수 있으므로 sessionStorage에만 보존한다.
+  // 브라우저/PWA 세션을 닫으면 사라지고, 켜진 동안에는 라이브 데이터가 캐시를 교체한다.
+  const CACHE_KEY = "omniCache.v1";
+  // 이전 버전이 장기 저장한 민감 캐시는 업데이트 시 1회 제거한다.
+  try {
+    localStorage.removeItem(CACHE_KEY);
+    localStorage.removeItem("srchRecent.v1");
+  } catch (e) {}
+  let omniCache = (() => {
+    try { return JSON.parse(sessionStorage.getItem(CACHE_KEY)) || {}; } catch (e) { return {}; }
+  })();
+  let cacheDirty = false, lastLiveAt = 0;
+  function saveCacheSoon() { cacheDirty = true; }
+  setInterval(() => {
+    if (!cacheDirty) return;
+    cacheDirty = false;
+    try { sessionStorage.setItem(CACHE_KEY, JSON.stringify(omniCache)); }
+    catch (e) { omniCache.screens = {}; }   // 용량 초과 시 화면 캐시부터 비움
+  }, 3000);
+
+  function clearSensitiveSessionData() {
+    sensitiveAuthorized = false; omniCache = {}; cacheDirty = false; lastLiveAt = 0;
+    try {
+      sessionStorage.removeItem(CACHE_KEY);
+      sessionStorage.removeItem("srchRecent.v1");
+    } catch (e) {}
+    stopCmuxPoll(); stopTermPoll(); stopHerdrPoll();
+    fastOmniUntil = 0; resetPttHoldState();
+    if (sheetPoll) clearInterval(sheetPoll);
+    sheetPoll = null; sheetTarget = null;
+    cmuxState = null; omniState = null; herdrState = null; wsStatuses = {};
+    lastCmuxJSON = ""; lastOmniJSON = ""; lastHerdrJSON = ""; lastStatusesJSON = "";
+    lastStatusReq = 0; lastCardsSig = ""; quietUntil = 0; prefetched.clear();
+    srchRecent = [];
+    clearTimeout(srchTimer); srchTimer = null;
+    srchActiveID = ""; srchView = { mode: "projects", cwd: "" };
+    ["sess-cards", "srch-results", "srch-recent", "term-screen",
+     "herdr-ws", "herdr-agents"].forEach((id) => {
+      const el = document.getElementById(id); if (el) el.replaceChildren();
+    });
+    if (srchInput) srchInput.value = "";
+    const termInput = document.getElementById("term-input"); if (termInput) termInput.value = "";
+    const term = document.getElementById("ss-term"); if (term) term.textContent = "";
+    const draft = document.getElementById("ss-input"); if (draft) draft.value = "";
+    const sheetTitle = document.getElementById("ss-title"); if (sheetTitle) sheetTitle.textContent = "";
+    const sheetSub = document.getElementById("ss-sub"); if (sheetSub) sheetSub.textContent = "";
+    const sheet = document.getElementById("sess-sheet"); if (sheet) sheet.hidden = true;
+    const ptt = document.getElementById("ptt-banner"); if (ptt) ptt.hidden = true;
+    const pttText = document.getElementById("pb-text"); if (pttText) pttText.textContent = "";
+    const pttSessions = document.getElementById("pb-sessions"); if (pttSessions) pttSessions.replaceChildren();
+    const pttSend = document.getElementById("pb-send"); if (pttSend) pttSend.onclick = null;
+    const pttCancel = document.getElementById("pb-cancel"); if (pttCancel) pttCancel.onclick = null;
+    const voice = document.getElementById("voice-pill");
+    if (voice) { voice.hidden = true; voice.replaceChildren(); }
+    ["qb-voice", "qb-dict"].forEach((id) => {
+      document.getElementById(id)?.classList.remove("rec", "proc");
+    });
+    const mux = document.getElementById("cmux-remote");
+    if (mux) mux.innerHTML = '<div class="cmux-empty">PIN 페어링 필요</div>';
+    const cap = document.getElementById("cap-result"); if (cap) cap.replaceChildren();
+    const mirrorInput = document.getElementById("mirror-input"); if (mirrorInput) mirrorInput.value = "";
+    mirror.generation += 1; mirror.pending = null;
+    if (mirror.canvas && mirror.ctx) mirror.ctx.clearRect(0, 0, mirror.canvas.width, mirror.canvas.height);
+  }
+
+  function restoreSensitiveSessionData() {
+    if (!sensitiveAuthorized) return;
+    if (omniCache.cmux) { cmuxState = omniCache.cmux; renderCmux(); }
+    if (omniCache.omni) { omniState = omniCache.omni; }
+    if (omniCache.cmux || omniCache.omni) renderSessCards();
+    if (currentTab === "search") renderSrchRecent();
+  }
+
+  /// 대기 세션 화면 프리페치 — 카드 탭 즉시 표시의 재료. 카드당 60초에 1회.
+  const prefetched = new Map();
+  function prefetchScreens() {
+    requestStatuses();   // 카드 ws 필 조회 (20s 스로틀 내장)
+    sessAttention().slice(0, 5).forEach((c) => {
+      // 읽기는 워크스페이스 스코프가 안전 (비활성 탭은 cmux가 읽기 거부)
+      const scope = c.ws ? "workspace" : (c.surface ? "surface" : null);
+      const id = c.ws || c.surface;
+      if (!scope || !id) return;
+      const last = prefetched.get(id) || 0;
+      if (Date.now() - last < 60000) return;
+      prefetched.set(id, Date.now());
+      send({ t: "csess", action: "read", name: scope, target: id, count: 300 });
+    });
+  }
+
+  // ── 조용히 모드: 사용자가 보고/만지는 동안엔 리렌더로 화면을 흔들지 않는다 ──
+  // 에이전트 패널 터치·스크롤 후 10초간 카드/칩 리렌더 보류 (데이터는 계속 수신,
+  // 조용 시간이 끝난 다음 폴에서 최신 상태로 그려짐).
+  let quietUntil = 0;
+  const agentPanel = document.getElementById("panel-agent");
+  if (agentPanel) {
+    ["touchstart", "scroll", "wheel"].forEach((ev) =>
+      agentPanel.addEventListener(ev, () => { quietUntil = Date.now() + 10000; }, { passive: true }));
+  }
+  function uiQuiet() { return Date.now() < quietUntil; }
+  let lastCardsSig = "";
+
+  function renderSessCards() {
+    const root = document.getElementById("sess-cards");
+    if (!root) return;
+    if (sheetTarget || uiQuiet()) return;   // 시트 열림·사용자 조작 중엔 흔들지 않음
+    const cards = sessAttention();
+    // 카드에 실제로 보이는 필드만으로 변경 감지 — 무관한 상태 변화로 리렌더하지 않음
+    const lk0 = sessLookups();
+    const sig = JSON.stringify(cards.map((c) => [
+      c.ws && lk0.wsTitle.get(c.ws) || c.title,
+      c.surface && lk0.tabTitle.get(c.surface) || c.cwd || "",
+      c.cat, c.headline, Math.floor((c.ts || 0) / 60),
+      lk0.wsColor.get(c.ws) || "", lk0.wsGroup.get(c.ws) || "",
+      wsStatuses[c.ws] || null, c.decisions || null,
+    ]));
+    if (sig === lastCardsSig) return;
+    lastCardsSig = sig;
+    root.innerHTML = "";
+    const head = document.createElement("div");
+    head.className = "agent-sec sess-head";
+    // 라이브 데이터가 아직이면(부팅 직후 캐시 표시 중) 캐시 시점을 밝힌다
+    const stale = !lastLiveAt && omniCache.ts
+      ? " · " + relTime(new Date(omniCache.ts).toISOString()) + " 캐시" : "";
+    head.textContent = (cards.length
+      ? "🟡 결정 대기 (" + cards.length + ")"
+      : "결정 대기 없음 ✓") + stale;
+    root.appendChild(head);
+    const lk = sessLookups();
+    cards.forEach((c) => {
+      const card = document.createElement("button");
+      card.className = "sess-card cat-" + c.cat;
+      // 워크스페이스 색 매칭: 좌측 액센트 바 + 제목 점을 cmux 워크스페이스 색으로
+      const wsColor = lk.wsColor.get(c.ws) || "";
+      if (wsColor) card.style.borderLeftColor = wsColor;
+      const top = document.createElement("div");
+      top.className = "sc-top";
+      const title = document.createElement("span");
+      title.className = "sc-title";
+      if (wsColor) {
+        const dot = document.createElement("span");
+        dot.className = "sc-wsdot"; dot.style.background = wsColor;
+        title.appendChild(dot);
+      }
+      title.appendChild(document.createTextNode((c.ws && lk.wsTitle.get(c.ws)) || c.title));
+      const group = lk.wsGroup.get(c.ws) || "";
+      if (group) {   // 소속 그룹 (cmux 사이드바 섹션)
+        const g = document.createElement("span");
+        g.className = "sc-group"; g.textContent = group;
+        title.appendChild(g);
+      }
+      const badge = document.createElement("span");
+      badge.className = "sc-badge";
+      badge.textContent = c.cat === "permission" ? "권한 요청" : "입력 대기";
+      const time = document.createElement("span");
+      time.className = "sc-time";
+      time.textContent = c.ts ? relTime(new Date(c.ts * 1000).toISOString()) : "";
+      top.append(title, badge, time);
+      card.appendChild(top);
+      // cmux 사이드바 필(결정 힌트·사분면·Running)을 색 그대로 코멘터리 줄로
+      const pills = wsStatuses[c.ws] || [];
+      if (pills.length) {
+        const row = document.createElement("div");
+        row.className = "sc-pills";
+        pills.slice(0, 3).forEach((p) => {
+          const s = document.createElement("span");
+          s.className = "sc-pill";
+          if (p.color) s.style.color = p.color;
+          s.textContent = pillIcon(p.icon) + " " + (p.text || "");
+          row.appendChild(s);
+        });
+        card.appendChild(row);
+      }
+      // 세션(탭) 구분 줄: 탭 제목(에이전트 진행상황이 실림) > cwd 폴더명(cmux 밖 세션) 순.
+      const tab = (c.surface && lk.tabTitle.get(c.surface)) || "";
+      const cwdBase = (c.cwd || "").split("/").filter(Boolean).pop() || "";
+      const subText = tab || (cwdBase && "📁 " + cwdBase);
+      if (subText) {
+        const sub = document.createElement("div");
+        sub.className = "sc-tab"; sub.textContent = subText;
+        card.appendChild(sub);
+      }
+      if (c.headline) {
+        const h = document.createElement("div");
+        h.className = "sc-headline"; h.textContent = c.headline;
+        card.appendChild(h);
+      }
+      // 원클릭 답장 칩: 요약기가 뽑은 결정 항목(에이전트의 후속 제안)을 탭 한 번에 전송.
+      // 카드가 <button>이라 자식 button 불가 — span[role=button] + stopPropagation.
+      if ((c.decisions || []).length) {
+        const row = document.createElement("div");
+        row.className = "sc-actions";
+        c.decisions.slice(0, 3).forEach((d) => {
+          const chip = document.createElement("span");
+          chip.className = "sc-act"; chip.setAttribute("role", "button");
+          chip.textContent = "↩ " + d;
+          chip.addEventListener("click", (e) => {
+            e.stopPropagation(); buzz();
+            const tgt = sessTargetOf(c);
+            if (!tgt.id) { toast("cmux 밖 세션 — 전송 불가"); return; }
+            send({ t: "csess", action: "send", name: tgt.scope,
+                   target: tgt.id, text: d.replace(/\r?\n/g, " ").trim(), submit: true });
+            toast("전송됨: " + d.slice(0, 40));
+          });
+          row.appendChild(chip);
+        });
+        card.appendChild(row);
+      }
+      card.addEventListener("click", () => {
+        buzz(); openSessSheet({ ...c, title: title.textContent, tab: subText });
+      });
+      root.appendChild(card);
+    });
+  }
+
+  // ═════════ 세션 검색 탭 (OmniControl 세션 코퍼스 — cmux-voice search의 모바일판) ═════════
+  // 빈 입력 = 작업폴더 브라우즈(projects → sessions), 2자+ = 풀텍스트 검색.
+  // 결과 탭 = 데몬 /focus(session·cwd·revive) — 살아있는 탭 포커스, 닫힌 세션은 부활.
+  const srchInput = document.getElementById("srch-input");
+  const srchResults = document.getElementById("srch-results");
+  let srchTimer = null, srchSeq = 0, srchActiveID = "";
+  let srchView = { mode: "projects", cwd: "" };
+  let srchRecent = (() => {
+    try { return JSON.parse(sessionStorage.getItem("srchRecent.v1")) || []; } catch (e) { return []; }
+  })();
+
+  function srchGo() {
+    const q = (srchInput.value || "").trim();
+    srchSeq += 1;
+    srchActiveID = "s" + srchSeq;
+    if (q.length >= 2) {
+      srchView = { mode: "hits", cwd: "" };
+      send({ t: "omniSearch", id: srchActiveID, text: q });
+    } else if (srchView.mode === "sessions" && srchView.cwd) {
+      send({ t: "omniSearch", id: srchActiveID, dir: "sessions", name: srchView.cwd });
+    } else {
+      srchView = { mode: "projects", cwd: "" };
+      send({ t: "omniSearch", id: srchActiveID, dir: "projects" });
+    }
+    document.getElementById("srch-clear").hidden = !q;
+  }
+  function srchDebounced() {
+    clearTimeout(srchTimer);
+    srchTimer = setTimeout(srchGo, 350);
+  }
+  srchInput?.addEventListener("input", srchDebounced);
+  srchInput?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { clearTimeout(srchTimer); srchGo(); srchInput.blur(); }
+  });
+  document.getElementById("srch-clear")?.addEventListener("click", () => {
+    srchInput.value = ""; srchView = { mode: "projects", cwd: "" }; srchGo();
+  });
+
+  function srchRememberQuery(q) {
+    if (!q || q.length < 2) return;
+    srchRecent = [q, ...srchRecent.filter((x) => x !== q)].slice(0, 8);
+    try { sessionStorage.setItem("srchRecent.v1", JSON.stringify(srchRecent)); } catch (e) {}
+    renderSrchRecent();
+  }
+  function renderSrchRecent() {
+    const box = document.getElementById("srch-recent");
+    if (!box) return;
+    box.innerHTML = "";
+    if (srchInput.value.trim() || !srchRecent.length) return;   // 입력 중엔 숨김
+    srchRecent.forEach((q) => {
+      const chip = document.createElement("button");
+      chip.className = "srch-chip"; chip.textContent = q;
+      chip.addEventListener("click", () => {
+        buzz(); srchInput.value = q; clearTimeout(srchTimer); srchGo();
+      });
+      box.appendChild(chip);
+    });
+  }
+
+  /// «하이라이트» 마커를 accent <b>로 (textContent 기반 — HTML 인젝션 불가)
+  function snippetNode(text) {
+    const div = document.createElement("div");
+    div.className = "srch-snip";
+    String(text || "").split("«").forEach((part, i) => {
+      if (i === 0) { div.appendChild(document.createTextNode(part)); return; }
+      const close = part.indexOf("»");
+      const b = document.createElement("b");
+      b.textContent = close >= 0 ? part.slice(0, close) : part;
+      div.appendChild(b);
+      if (close >= 0) div.appendChild(document.createTextNode(part.slice(close + 1)));
+    });
+    return div;
+  }
+
+  function srchRow(main, sub, onTap) {
+    const b = document.createElement("button");
+    b.className = "srch-row";
+    const m = document.createElement("div");
+    m.className = "srch-main"; m.textContent = main;
+    b.appendChild(m);
+    if (sub) {
+      const s = document.createElement("div");
+      s.className = "srch-sub"; s.textContent = sub;
+      b.appendChild(s);
+    }
+    b.addEventListener("click", () => { buzz(); onTap(b); });
+    return b;
+  }
+
+  function openHit(sessionId, cwd, btn) {
+    btn.classList.add("busy");
+    toast("맥에서 여는 중… (닫힌 세션은 부활 ~2초)");
+    send({ t: "omniFocus", target: sessionId, name: cwd });
+  }
+
+  function renderSearch(res) {
+    if (!srchResults) return;
+    if (!res || res.id !== srchActiveID) return;   // 늦게 도착한 이전 검색 응답은 폐기
+    srchResults.innerHTML = "";
+    const empty = (msg) => {
+      const d = document.createElement("div");
+      d.className = "cmux-empty"; d.textContent = msg;
+      srchResults.appendChild(d);
+    };
+    if (!res || res.available === false) {
+      empty(res && res.code === 503
+        ? "세션 코퍼스 인덱스가 아직 없어요 — 맥에서 `cmux-voice corpus reindex`"
+        : "검색 서비스에 연결 못 함 (OmniControl 데몬 확인)");
+      return;
+    }
+    const r = res.result || {};
+    if (r.results) {   // ── 풀텍스트 히트 ──
+      srchRememberQuery(r.query);
+      if (!r.results.length) { empty("결과 없음: " + r.query); return; }
+      r.results.forEach((h) => {
+        const folder = (h.cwd || "").split("/").filter(Boolean).pop() || "";
+        const row = srchRow(h.title || "(무제 세션)",
+          "📁 " + folder + " · " + relTime(h.last_ts) + " · " + h.hits + "곳",
+          (btn) => openHit(h.session_id, h.cwd || "", btn));
+        (h.snippets || []).slice(0, 2).forEach((sn) => row.appendChild(snippetNode(sn.text)));
+        srchResults.appendChild(row);
+      });
+    } else if (r.sessions) {   // ── 폴더 안 세션 브라우즈 ──
+      const back = srchRow("← 작업폴더 전체", "", () => {
+        srchView = { mode: "projects", cwd: "" }; srchGo();
+      });
+      back.classList.add("srch-back");
+      srchResults.appendChild(back);
+      const folder = (r.cwd || "").split("/").filter(Boolean).pop() || r.cwd;
+      const head = document.createElement("div");
+      head.className = "agent-sec"; head.textContent = "📁 " + folder + " — 세션 " + r.sessions.length + "개";
+      srchResults.appendChild(head);
+      r.sessions.forEach((s) => {
+        srchResults.appendChild(srchRow(s.title || "(무제 세션)",
+          relTime(s.last_ts) + " · 메시지 " + (s.msg_count || 0),
+          (btn) => openHit(s.session_id, s.cwd || r.cwd || "", btn)));
+      });
+    } else if (r.projects) {   // ── 작업폴더 목록 (빈 검색창 기본 화면) ──
+      const head = document.createElement("div");
+      head.className = "agent-sec"; head.textContent = "작업폴더 " + r.projects.length + "개 — 최근 순";
+      srchResults.appendChild(head);
+      r.projects.forEach((p) => {
+        srchResults.appendChild(srchRow(p.name || p.cwd,
+          relTime(p.last_ts) + " · 세션 " + p.sessions + " · 메시지 " + p.msgs,
+          () => { srchView = { mode: "sessions", cwd: p.cwd }; srchGo(); }));
+      });
+    } else {
+      empty("결과 없음");
+    }
+  }
+
+  // ═════════ PTT 전송 확인 배너 (맥 확인 카드의 모바일 미러) ═════════
+  // 퀵바 '음성 지시' 직후 40초간 1초 폴링으로 confirming을 빠르게 잡고,
+  // 배너가 뜨는 순간 hold를 보내 맥 카운트다운을 멈춘다 (앱 45초 상한 자동 재개).
+  let fastOmniUntil = 0, pttHeldTs = 0, pttCardTs = 0;
+  let pttHoldAttempts = 0, pttHoldPending = false, pttHoldRequestID = "";
+  let pttHoldTimer = null, pendingPttDecision = null;
+  // 퀵바 음성 버튼 탭 → 40초간 빠른 폴링 (녹음/인식 상태·confirming을 놓치지 않게)
+  ["qb-voice", "qb-dict"].forEach((id) => {
+    document.getElementById(id)?.addEventListener("click", () => {
+      fastOmniUntil = Date.now() + 40000;
+    });
+  });
+
+  /// 맥의 음성 입력 라이브 상태 (state.voice) → 상단 필 + 퀵바 버튼 하이라이트.
+  /// 맥북 화면을 안 봐도 "지금 음성 지시인지 받아쓰기인지, 듣는 중인지"가 폰에 보인다.
+  function renderVoicePill() {
+    const pill = document.getElementById("voice-pill");
+    if (!pill) return;
+    const v = omniState && omniState.available && omniState.state && omniState.state.voice;
+    const fresh = v && v.ts && (Date.now() / 1000 - v.ts) < 90;   // stale 방어
+    const qbVoice = document.getElementById("qb-voice");
+    const qbDict = document.getElementById("qb-dict");
+    [qbVoice, qbDict].forEach((b) => b && b.classList.remove("rec", "proc"));
+    if (!fresh || v.state === "confirming") {   // confirming은 전송 배너가 담당
+      pill.hidden = true;
+      return;
+    }
+    const laneName = v.lane === "dictation" ? "✍️ 받아쓰기" : "🎙 음성 지시";
+    const btn = v.lane === "dictation" ? qbDict : qbVoice;
+    if (v.state === "recording") {
+      btn?.classList.add("rec");
+      pill.classList.remove("processing");
+      pill.innerHTML = "";
+      const dot = document.createElement("span"); dot.className = "vp-dot";
+      pill.append(dot, document.createTextNode(
+        laneName + " — 듣는 중" + (v.toggled ? " (버튼 다시 탭 = 종료)" : "")));
+      pill.hidden = false;
+      fastOmniUntil = Math.max(fastOmniUntil, Date.now() + 15000);   // 상태 추적 유지
+    } else if (v.state === "processing") {
+      btn?.classList.add("proc");
+      pill.classList.add("processing");
+      pill.innerHTML = "";
+      const dot = document.createElement("span"); dot.className = "vp-dot";
+      pill.append(dot, document.createTextNode(laneName + " — 인식 중…"));
+      pill.hidden = false;
+      fastOmniUntil = Math.max(fastOmniUntil, Date.now() + 15000);
+    } else {
+      pill.hidden = true;
+    }
+  }
+  setInterval(() => {
+    if (sensitiveAuthorized && Date.now() < fastOmniUntil
+        && document.visibilityState === "visible") requestOmni();
+  }, 1000);
+  function omniPtt(action, ref, successMessage) {
+    const requestID = "ptt" + Math.random().toString(36).slice(2, 10);
+    if (action === "hold") pttHoldRequestID = requestID;
+    if (successMessage) pendingPttDecision = { id: requestID, action, successMessage };
+    send({ t: "omniPtt", id: requestID, dir: action, target: ref || "" });
+  }
+  function resetPttHoldState() {
+    if (pttHoldTimer) clearTimeout(pttHoldTimer);
+    pttHoldTimer = null; pttHeldTs = 0; pttCardTs = 0;
+    pttHoldAttempts = 0; pttHoldPending = false; pttHoldRequestID = "";
+    pendingPttDecision = null;
+  }
+  function attemptPttHold() {
+    if (!pttCardTs || pttHeldTs === pttCardTs || pttHoldPending || pttHoldAttempts >= 3) return;
+    pttHoldPending = true; pttHoldAttempts += 1;
+    omniPtt("hold");
+    if (pttHoldTimer) clearTimeout(pttHoldTimer);
+    pttHoldTimer = setTimeout(() => {
+      if (!pttHoldPending) return;
+      pttHoldPending = false;
+      if (pttHoldAttempts < 3) attemptPttHold();
+      else toast("카운트다운 보류 응답 없음 — Mac 확인이 필요합니다");
+    }, 1200);
+  }
+  function handleOmniPttAck(message) {
+    if (message.action === "hold") {
+      if (!pttHoldPending || message.id !== pttHoldRequestID) return;
+      if (pttHoldTimer) clearTimeout(pttHoldTimer);
+      pttHoldTimer = null;
+      pttHoldPending = false;
+      if (message.ok) {
+        pttHeldTs = pttCardTs;
+      } else if (pttHoldAttempts < 3) {
+        setTimeout(attemptPttHold, 350);
+      } else {
+        toast("카운트다운 보류 실패 — Mac 확인이 필요합니다");
+      }
+      return;
+    }
+    if (!pendingPttDecision || pendingPttDecision.id !== message.id
+        || pendingPttDecision.action !== message.action) return;
+    const pending = pendingPttDecision;
+    pendingPttDecision = null;
+    if (message.ok) {
+      const el = document.getElementById("ptt-banner"); if (el) el.hidden = true;
+      toast(pending.successMessage);
+      setTimeout(requestOmni, 800);
+    } else {
+      toast("결정 반영 실패 — 로컬 통합 상태를 확인하세요");
+    }
+  }
+  function renderPttBanner() {
+    const el = document.getElementById("ptt-banner");
+    if (!el) return;
+    const ptt = omniState && omniState.available && omniState.state && omniState.state.ptt;
+    if (!ptt || !ptt.text) {
+      el.hidden = true; resetPttHoldState();
+      return;
+    }
+    el.hidden = false;
+    if (pttCardTs !== ptt.ts) {
+      resetPttHoldState(); pttCardTs = ptt.ts;
+    }
+    if (pttHeldTs !== ptt.ts) {
+      attemptPttHold();
+      fastOmniUntil = Math.max(fastOmniUntil, Date.now() + 60000);  // 결정까지 상태 추적
+    }
+    document.getElementById("pb-text").textContent = "“" + ptt.text + "”"
+      + (ptt.engine ? "  〰 " + ptt.engine : "");
+    const list = document.getElementById("pb-sessions");
+    list.innerHTML = "";
+    const lk = sessLookups();
+    (ptt.sessions || []).forEach((s) => {
+      const b = document.createElement("button");
+      b.className = "pb-sess" + (s.ref === ptt.target ? " on" : "");
+      const color = lk.wsColor.get(s.ref);
+      if (color) {
+        const dot = document.createElement("span");
+        dot.className = "sc-wsdot"; dot.style.background = color;
+        b.appendChild(dot);
+      }
+      b.appendChild(document.createTextNode(
+        (s.name || s.ref) + (s.ref === ptt.target ? " · 기본" : "")));
+      b.addEventListener("click", () => {
+        buzz(); omniPtt("send", s.ref, "전송: " + (s.name || "세션"));
+        toast("처리 중…");
+      });
+      list.appendChild(b);
+    });
+    document.getElementById("pb-send").onclick = () => {
+      buzz(); omniPtt("send", ptt.target || "", "전송됨");
+      toast("처리 중…");
+    };
+    document.getElementById("pb-cancel").onclick = () => {
+      buzz(); omniPtt("cancel", "", "취소됨");
+      toast("처리 중…");
+    };
+  }
+
+  // ── 세션 상세 시트: 포커스 안 뺏는 read-screen + 세션별 send ──
+  let sheetTarget = null, sheetPoll = null;   // {scope,id,ws,title}
+
+  function sessTargetOf(c) {
+    // notif에 surface가 있으면 그 탭을 정밀 타깃, 없으면 워크스페이스(포커스된 탭)로.
+    return c.surface ? { scope: "surface", id: c.surface }
+                     : { scope: "workspace", id: c.ws };
+  }
+
+  function openSessSheet(c) {
+    const tgt = sessTargetOf(c);
+    if (!tgt.id) { toast("cmux 밖 세션 — 워크스페이스 정보 없음"); return; }
+    // 읽기와 입력을 분리: 입력은 탭(surface) 정밀 타깃 유지, 읽기는 실패 시
+    // 워크스페이스 활성 화면으로 폴백 (cmux는 비활성 탭의 화면을 읽지 못한다).
+    sheetTarget = { ...tgt, ws: c.ws, title: c.title, lastSig: "",
+                    readScope: tgt.scope, readId: tgt.id };
+    document.getElementById("ss-title").textContent = c.title;
+    document.getElementById("ss-sub").textContent =
+      [c.tab, c.headline].filter(Boolean).join(" · ");
+    const t = document.getElementById("ss-term");
+    // 캐시된 화면이 있으면 즉시 표시 (프리페치 덕에 대부분 즉답) → 라이브 갱신이 교체
+    const scr = (omniCache.screens || {});
+    const cached = scr[sheetTarget.readId] || (sheetTarget.ws && scr[sheetTarget.ws]);
+    if (cached && cached.html) { t.innerHTML = cached.html; t.style.background = cached.bg || ""; }
+    else if (cached && cached.text) { t.textContent = cached.text; t.style.background = ""; }
+    else { t.textContent = "화면 불러오는 중…"; t.style.background = ""; }
+    requestAnimationFrame(() => { t.scrollTop = t.scrollHeight; });
+    // 작성 중이던 프롬프트 복원 (앱이 죽어도 살아남음)
+    const draft = ((omniCache.drafts || {})[sheetTarget.id]) || "";
+    const inp = document.getElementById("ss-input");
+    if (inp) inp.value = draft;
+    document.getElementById("sess-sheet").hidden = false;
+    stopCmuxPoll();   // 시트가 전체 화면 — 뒤의 카드/칩 폴링은 소음일 뿐
+    sessRead();
+    sheetPoll = setInterval(() => {
+      if (document.visibilityState === "visible") sessRead();
+    }, 3000);
+  }
+
+  function closeSessSheet() {
+    document.getElementById("sess-sheet").hidden = true;
+    if (sheetPoll) clearInterval(sheetPoll);
+    sheetPoll = null; sheetTarget = null;
+    startCmuxPoll();   // 카드/칩 갱신 재개
+  }
+
+  function sessRead() {
+    if (!sheetTarget) return;
+    send({ t: "csess", action: "read", name: sheetTarget.readScope,
+           target: sheetTarget.readId, count: 1000 });
+  }
+
+  /// 바닥 근처에서만 자동 스크롤 — 위로 올려 읽는 중엔 위치를 지킨다.
+  function nearBottom(el) { return el.scrollHeight - el.scrollTop - el.clientHeight < 60; }
+
+  function onSessRead(m) {
+    // 시트 표시 여부와 무관하게 화면 캐시에 적재 (프리페치 응답 포함)
+    if (!m.error && m.id) {
+      let entry;
+      if (m.grid) { const o = gridToHTML(m.grid); entry = { html: o.html, bg: o.bg, ts: Date.now() }; }
+      else entry = { text: (m.text || "").slice(-30000), ts: Date.now() };
+      omniCache.screens = omniCache.screens || {};
+      omniCache.screens[m.id] = entry;
+      const ks = Object.keys(omniCache.screens);
+      if (ks.length > 10) {   // 용량 관리: 오래된 화면부터 제거
+        ks.sort((a, b) => omniCache.screens[a].ts - omniCache.screens[b].ts);
+        delete omniCache.screens[ks[0]];
+      }
+      saveCacheSoon();
+    }
+    if (!sheetTarget || m.id !== sheetTarget.readId) return;
+    const el = document.getElementById("ss-term");
+    if (m.error) {
+      // 비활성 탭은 cmux가 화면을 못 읽는다 → 그 워크스페이스의 활성 화면으로 폴백
+      if (sheetTarget.readScope === "surface" && sheetTarget.ws) {
+        sheetTarget.readScope = "workspace"; sheetTarget.readId = sheetTarget.ws;
+        sessRead(); return;
+      }
+      if (!sheetTarget.lastSig) el.textContent = "화면을 읽지 못했습니다 (cmux 연결 확인)";
+      return;
+    }
+    const stick = nearBottom(el);
+    if (m.grid) {   // 포커스된 탭 = cmux 뷰와 동일한 컬러 그리드
+      const out = gridToHTML(m.grid);
+      const sig2 = "g:" + out.html.length + ":" + out.html.slice(-80);
+      if (sig2 === sheetTarget.lastSig) return;
+      sheetTarget.lastSig = sig2;
+      el.style.background = out.bg;
+      el.innerHTML = out.html;
+    } else {
+      const text = m.text || "(빈 화면)";
+      if (text === sheetTarget.lastSig) return;   // 변경 없으면 화면 안 흔듦
+      sheetTarget.lastSig = text;
+      el.style.background = "";
+      el.textContent = text;
+    }
+    if (stick) el.scrollTop = el.scrollHeight;
+  }
+
+  // 시트 요소가 없어도(HTML/JS 버전 스큐 — PWA가 옛 index를 캐시한 경우) 앱 전체가
+  // 죽지 않게 null-safe로 묶는다. connect()가 파일 끝에 있어 여기서 죽으면 연결 자체가 안 됨.
+  const ssEl = (id) => document.getElementById(id);
+  ssEl("ss-close")?.addEventListener("click", () => { buzz(); closeSessSheet(); });
+
+  // ── 뒤로가기 스와이프: 왼쪽 가장자리에서 오른쪽으로 밀면 시트 닫기 (iOS 내비 관성) ──
+  (function setupSheetSwipeBack() {
+    const sheet = document.getElementById("sess-sheet");
+    if (!sheet) return;
+    let startX = 0, startY = 0, tracking = false, swiping = false;
+    sheet.addEventListener("touchstart", (e) => {
+      const t = e.touches[0];
+      startX = t.clientX; startY = t.clientY;
+      tracking = startX <= 28;   // 가장자리에서 시작한 터치만 (터미널 스크롤과 충돌 방지)
+      swiping = false;
+    }, { passive: true });
+    sheet.addEventListener("touchmove", (e) => {
+      if (!tracking) return;
+      const t = e.touches[0];
+      const dx = t.clientX - startX, dy = t.clientY - startY;
+      if (!swiping) {
+        if (Math.abs(dy) > Math.abs(dx) || dx < 12) return;   // 수직 스크롤 우선
+        swiping = true;
+        sheet.style.transition = "none";
+      }
+      sheet.style.transform = "translateX(" + Math.max(0, dx) + "px)";
+    }, { passive: true });
+    sheet.addEventListener("touchend", (e) => {
+      if (!swiping) { tracking = false; return; }
+      const dx = (e.changedTouches[0]?.clientX ?? startX) - startX;
+      sheet.style.transition = "transform .18s ease-out";
+      if (dx > 90) {   // 충분히 밀었으면 닫기
+        sheet.style.transform = "translateX(100%)";
+        setTimeout(() => {
+          closeSessSheet();
+          sheet.style.transition = ""; sheet.style.transform = "";
+        }, 180);
+      } else {         // 스프링백
+        sheet.style.transform = "translateX(0)";
+        setTimeout(() => { sheet.style.transition = ""; sheet.style.transform = ""; }, 200);
+      }
+      tracking = false; swiping = false;
+    }, { passive: true });
+  })();
+  ssEl("ss-goto")?.addEventListener("click", () => {
+    if (!sheetTarget) return;
+    buzz();
+    if (sheetTarget.ws) requestCmux("select-workspace", sheetTarget.ws);
+    if (sheetTarget.scope === "surface") requestCmux("focus-tab", sheetTarget.id);
+    toast("맥에서 세션으로 전환했습니다");
+  });
+  document.querySelectorAll("#sess-sheet .ss-keys button").forEach((b) => {
+    b.addEventListener("click", () => {
+      if (!sheetTarget) return;
+      buzz();
+      send({ t: "csess", action: "key", name: sheetTarget.scope,
+             target: sheetTarget.id, text: b.dataset.k });
+      setTimeout(sessRead, 600);   // 키 반영된 화면 바로 재읽기
+    });
+  });
+  ssEl("ss-send")?.addEventListener("click", () => {
+    if (!sheetTarget) return;
+    const input = document.getElementById("ss-input");
+    if (!input) return;
+    // 실제 개행은 Claude Code에서 조기 제출이 될 수 있어 공백으로 눌러 보낸다.
+    const text = input.value.replace(/\r?\n/g, " ").trim();
+    if (!text) return;
+    buzz();
+    send({ t: "csess", action: "send", name: sheetTarget.scope,
+           target: sheetTarget.id, text, submit: true });
+    input.value = "";
+    if (omniCache.drafts) { delete omniCache.drafts[sheetTarget.id]; saveCacheSoon(); }
+    toast("프롬프트 전송됨");
+    setTimeout(sessRead, 900);
+  });
+  // 프롬프트 초안 실시간 보존
+  ssEl("ss-input")?.addEventListener("input", (e) => {
+    if (!sheetTarget) return;
+    omniCache.drafts = omniCache.drafts || {};
+    omniCache.drafts[sheetTarget.id] = e.target.value;
+    saveCacheSoon();
+  });
 
   // ═════════ herdr 전용 탭 (원격 에이전트 상태 대시보드) ═════════
   // backend=herdr 로 같은 상태 프로토콜을 재사용하되, tabs[]를 '에이전트 상태 카드'로 렌더.
@@ -1973,6 +2950,9 @@
       '<div class="seg" id="set-theme"><button data-theme="system">시스템</button><button data-theme="light">라이트</button><button data-theme="dark">다크</button></div>' +
       '<div class="set-section">화면 모드</div>' +
       '<div class="seg" id="set-layout"><button data-lay="auto">자동</button><button data-lay="phone">폰</button><button data-lay="tablet">태블릿</button></div>' +
+      '<div class="set-section">Obsidian 볼트 (이 기기에만 저장)</div>' +
+      '<div class="gesture-row"><label for="set-vault-primary">볼트 1</label><input class="set-text" id="set-vault-primary" placeholder="선택 사항" autocomplete="off" autocapitalize="off" spellcheck="false"></div>' +
+      '<div class="gesture-row"><label for="set-vault-secondary">볼트 2</label><input class="set-text" id="set-vault-secondary" placeholder="선택 사항" autocomplete="off" autocapitalize="off" spellcheck="false"></div>' +
       '<div class="set-section">제스처 할당</div>' +
       GESTURE_SLOTS.map(function (slot) {
         return '<div class="gesture-row"><label>' + slot[1] + '</label><select data-gkey="' + slot[0] + '">' +
@@ -2021,6 +3001,12 @@
     bind("hz", "pointerHz", true);
     bind("smooth", "pointerSmoothing", true);
     bind("resolution", "resolutionScale", true);
+
+    [["primary", "vaultPrimary"], ["secondary", "vaultSecondary"]].forEach(([id, key]) => {
+      const el = modalRoot.querySelector("#set-vault-" + id);
+      el.value = settings[key] || "";
+      el.addEventListener("input", () => { settings[key] = el.value; saveSettings(); });
+    });
 
     function syncNetworkSliders() {
       [["hz","pointerHz"],["smooth","pointerSmoothing"],["resolution","resolutionScale"]].forEach(([id, key]) => {
@@ -2086,7 +3072,14 @@
     });
 
     modalRoot.querySelector("#set-reset").addEventListener("click", () => {
-      settings = Object.assign({}, SETTINGS_DEFAULTS); saveSettings(); applyTheme(); openSettings();
+      const vaultPrimary = settings.vaultPrimary || "";
+      const vaultSecondary = settings.vaultSecondary || "";
+      settings = Object.assign({}, SETTINGS_DEFAULTS, {
+        vaultPrimary, vaultSecondary,
+        gestures: Object.assign({}, DEFAULT_GESTURES),
+        gesturesVersion: GESTURES_VERSION
+      });
+      saveSettings(); applyTheme(); openSettings();
     });
     updateLogos();   // About 로고를 현재 테마에 맞게
   }
@@ -2282,5 +3275,6 @@
   applyDeviceClass(true);               // 기기 구분/도킹 클래스 (sheetEl 정의 후 안전)
   renderDeck();
   setSheetPos(sheetPos, false);         // 시작 시 기억된 높이로 (기본: 풀화면)
+  // 민감 캐시는 서버가 현재 PIN epoch를 승인한 뒤에만 복원한다.
   connect();
 })();

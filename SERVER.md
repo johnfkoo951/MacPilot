@@ -1,50 +1,64 @@
-# MacPilot 상시 서버 (launchd)
+# CmdPilot 상시 서버 (launchd)
 
-Xcode 없이 **로그인 시 자동 시작 + 죽으면 자동 재시작**으로 항상 돌아가는 서버.
-(pm2 의 macOS 네이티브 등가물 = `launchd` LaunchAgent. GUI 세션에서 돌아야 손쉬운 사용 권한이 동작하므로 데몬이 아니라 **사용자 LaunchAgent**를 사용.)
+CmdPilot Helper는 GUI 세션의 사용자 LaunchAgent로 실행됩니다. 로그인 시 시작하고 프로세스가
+종료되면 launchd가 다시 시작합니다. 손쉬운 사용 권한이 필요한 앱이므로 시스템 데몬이 아닙니다.
 
 ## 구성
-- 앱: `~/Applications/MacPilot Helper.app` (Apple Development 서명 — 인증서 없으면 ad-hoc 폴백)
-- LaunchAgent: `~/Library/LaunchAgents/com.joonlab.macpilot.helper.plist` — **없으면 `deploy.sh`가 자동 생성**
-  - `RunAtLoad`(로그인 시 시작) + `KeepAlive`(상시 상주/재시작)
-- 포트: `HelperServer.swift`의 `port` 상수. **이 머신은 8766** (8765는 OmniControl bridge 점유)
-- 접속: `http://<your-mac-name>.local:8766` (mDNS — IP 바뀌어도 고정). 정확한 주소는 `echo http://$(scutil --get LocalHostName).local:8766`
 
-## 관리 명령
+- 앱: `~/Applications/CmdPilot Helper.app`
+- LaunchAgent: `~/Library/LaunchAgents/com.cmdspace.cmdpilot.helper.plist`
+- 기본 포트: `8766` (`HelperServer.swift`의 `port` 상수가 정본)
+- LAN 주소: `http://<mac-name>.local:8766`
+- 로컬 데이터: `~/Library/Application Support/CmdPilot/`
+
+`deploy.sh`는 앱을 빌드·서명·설치하고, plist가 없으면 생성한 뒤 LaunchAgent를 재시작합니다.
+
+## 관리
+
 ```bash
 ./script/macpilotctl.sh status
-./script/macpilotctl.sh stop       # 자동 재시작까지 멈춤
+./script/macpilotctl.sh stop
 ./script/macpilotctl.sh start
 ./script/macpilotctl.sh restart
 ./script/macpilotctl.sh logs
 ./script/macpilotctl.sh open
 ```
 
-직접 `launchctl`로 다루려면:
+직접 launchctl을 사용할 때:
 
 ```bash
-UID=$(id -u); PLIST=~/Library/LaunchAgents/com.joonlab.macpilot.helper.plist
+uid="$(id -u)"
+label="com.cmdspace.cmdpilot.helper"
+plist="$HOME/Library/LaunchAgents/$label.plist"
 
-# 상태 확인
-launchctl print gui/$UID/com.joonlab.macpilot.helper | grep -E "state|pid"
-
-# 중지 (자동 재시작 포함 완전 정지)
-launchctl bootout gui/$UID "$PLIST"
-
-# 시작
-launchctl bootstrap gui/$UID "$PLIST"
-
-# 재시작만
-launchctl kickstart -k gui/$UID/com.joonlab.macpilot.helper
+launchctl print "gui/$uid/$label"
+launchctl bootout "gui/$uid" "$plist"
+launchctl bootstrap "gui/$uid" "$plist"
+launchctl kickstart -k "gui/$uid/$label"
 ```
 
-## 코드 수정 후 업데이트
+## 코드 반영
+
 ```bash
-./deploy.sh      # Release 빌드 → ~/Applications 갱신 → 재시작
+./script/macpilotctl.sh sync-web  # HTML/JS/CSS만 로컬 override에 반영
+./deploy.sh                       # Swift 또는 번들 리소스 변경을 빌드·설치
 ```
 
-## 주의
-- **Mac 이 깨어 있고 같은 Wi-Fi** 에 있어야 폰에서 접속됨 (잠자면 서버도 잠듦).
-- 첫 실행 후 **손쉬운 사용 권한 1회 부여** 필요 (고정 서명이라 이후 유지). 메뉴바 아이콘 → "권한 요청".
-- Xcode에서 직접 Run하면 설치된 LaunchAgent 인스턴스와 포트가 겹칠 수 있음. 평소에는 `./deploy.sh` 또는 `./script/macpilotctl.sh restart` 사용.
-- 재부팅 후엔 **사용자 로그인** 시 자동 시작 (자동 로그인이면 부팅 직후).
+네이티브와 웹 프로토콜을 함께 바꾼 경우에는 `sync-web`만 실행하지 말고 `./deploy.sh`를
+사용합니다. 배포 시 기존 웹 override도 같은 소스로 맞춘 뒤 서버를 재시작합니다.
+
+Xcode에서 직접 실행하기 전에는 설치된 LaunchAgent를 중지해야 포트 충돌이 나지 않습니다.
+
+## TLS와 비밀
+
+PKCS#12 및 인증서는 `~/Library/Application Support/CmdPilot/tls/`에 두고 Git에 넣지 않습니다.
+PKCS#12 암호는 소스나 셸 이력에 쓰지 말고 다음 명령의 보안 프롬프트로 Keychain에 저장합니다.
+내장 PKCS#12 HTTPS는 메모리 전용 import가 가능한 macOS 15 이상에서만 켜집니다. macOS 13–14는
+`script/tailscale-https.sh`의 private Tailscale Serve 경로를 사용하세요.
+
+```bash
+./script/configure-secrets.sh tls
+./script/macpilotctl.sh restart
+```
+
+원격 접속과 장애 점검은 [docs/CONNECTION.md](docs/CONNECTION.md)를 참고하세요.

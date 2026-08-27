@@ -7,7 +7,7 @@
 # 사용법: bash script/tailscale-https.sh [on|off|status]
 set -euo pipefail
 
-PORT=8766   # HelperServer.swift 의 port 상수 (이 머신은 8766)
+PORT=8766   # HelperServer.swift 의 기본 port 상수
 TS="$(command -v tailscale || echo /usr/local/bin/tailscale)"
 [ -x "$TS" ] || TS=/Applications/Tailscale.app/Contents/MacOS/Tailscale
 [ -x "$TS" ] || { echo "tailscale CLI를 찾지 못했습니다."; exit 1; }
@@ -18,8 +18,6 @@ case "$cmd" in
     echo "▶ tailscale serve: https:443 → http://127.0.0.1:${PORT}"
     "$TS" serve --bg --https=443 "http://127.0.0.1:${PORT}"
     DNS="$("$TS" status --json | /usr/bin/python3 -c 'import json,sys;print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))')"
-    echo "▶ 인증서 미리 발급(폰 첫 접속 지연 방지)…"
-    "$TS" cert "$DNS" >/dev/null 2>&1 && rm -f "${DNS}.crt" "${DNS}.key" || true
     echo ""
     echo "✅ 에어마우스용 HTTPS 주소:  https://${DNS}"
     echo "   폰(Tailscale 켠 상태)에서 이 주소로 접속 → 🛸 에어 버튼 → 모션 권한 허용."

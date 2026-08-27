@@ -53,12 +53,14 @@
 - **Tailscale**: 테일넷 기기면 어느 네트워크에서든 접속 (아래 참고)
 
 **🔒 보안**
-- LAN/테일넷 전용, 기본 무인증 — 공용 Wi-Fi에서는 메뉴바에서 **PIN 페어링** 켜기 (upstream 기능)
+- LAN/테일넷 전용, 기본 무인증 — 공용 Wi-Fi에서는 메뉴바에서 **PIN 페어링** 켜기
+- 브라우저 WebSocket은 same-origin과 로컬 Host 화이트리스트(또는 Tailscale 소유 `*.ts.net`)를 검증하고, 세션 검색·원격 결정 통합은 PIN이 켜져야 동작
+- 인증서·토큰·개인 볼트명은 저장소에 넣지 않고 Keychain/기기별 로컬 설정으로 분리
 
 ## 설치
 
 ```bash
-git clone https://github.com/johnfkoo951/CmdPilot.git && cd MacPilot
+git clone https://github.com/johnfkoo951/CmdPilot.git && cd CmdPilot
 brew install xcodegen
 ./deploy.sh        # Release 빌드 → ~/Applications 설치 → LaunchAgent(상시 서버) 자동 구성
 ```
@@ -66,8 +68,8 @@ brew install xcodegen
 1. 메뉴바 📡(권한 없으면 ⚠️) 클릭 → **권한 열기** → 손쉬운 사용에서 *CmdPilot Helper* 켜기 (1회)
 2. 폰에서 메뉴바에 표시된 주소 열기 (QR 스캔 가능) → **공유 → 홈 화면에 추가**
 
-> Apple ID를 Xcode에 로그인해두면 고정 서명이 되어 재빌드해도 권한이 유지됩니다.
-> 없으면 ad-hoc 서명으로 동작하되, 재빌드 때마다 권한을 다시 켜야 합니다 (deploy.sh가 안내).
+> 기본 배포에는 Keychain의 안정적인 code-sign identity가 필요합니다. 정말 필요한 임시 개발 환경에서만
+> `ALLOW_ADHOC_SIGNING=1 ./deploy.sh`로 강등할 수 있으며, 재빌드 후 손쉬운 사용 권한을 다시 켜야 합니다.
 
 ### 관리
 
@@ -76,6 +78,9 @@ brew install xcodegen
 ./script/macpilotctl.sh sync-web     # 웹(HTML/JS/CSS)만 고쳤을 때 — 재빌드 없이 즉시 반영
 ./deploy.sh                          # Swift 수정 시 재빌드·재배포
 ```
+
+네이티브와 웹 프로토콜을 함께 바꾼 업데이트는 `deploy.sh`를 사용하세요. 배포 스크립트는 기존
+웹 override가 있으면 새 소스로 동기화한 뒤 서버를 재시작합니다.
 
 서버는 launchd LaunchAgent로 **로그인 시 자동 시작, 죽으면 자동 재시작**됩니다 (터미널 무관). 상세: [SERVER.md](SERVER.md)
 
@@ -90,6 +95,16 @@ http://<mac-name>.<tailnet>.ts.net:8766     # MagicDNS — 어느 네트워크�
 - 이 주소로 PWA를 설치하면 집/밖 구분 없이 하나의 아이콘으로 사용 (LAN에서도 WireGuard 직결이라 손해 거의 없음)
 - 안드로이드도 이 주소로 mDNS 없이 접속 (IP 바뀜 문제 종결)
 - ⚠️ **Funnel로 포트를 공개하지 말 것** — 테일넷 안에서만
+
+자체 TLS 또는 선택적 로컬 에이전트 통합의 비밀은 보안 프롬프트로 등록합니다. 실제 주소,
+인증서와 토큰은 Git에 포함하지 않습니다.
+
+```bash
+./script/configure-secrets.sh status
+./script/configure-secrets.sh tls
+```
+
+상세 런북: [docs/CONNECTION.md](docs/CONNECTION.md)
 
 ## 제스처
 

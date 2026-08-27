@@ -7,39 +7,56 @@ cd "$(dirname "$0")"
 APP_NAME="CmdPilot Helper"
 LABEL="com.cmdspace.cmdpilot.helper"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-# 포트는 HelperServer.swift 의 상수에서 자동 감지 (이 머신은 8766 — 8765는 OmniControl 이 사용)
+# 포트는 HelperServer.swift 의 상수에서 자동 감지
 PORT=$(sed -n 's/.*let port: UInt16 = \([0-9][0-9]*\).*/\1/p' MacHelper/Sources/HelperServer.swift)
-PORT=${PORT:-8765}
+PORT=${PORT:-8766}
 
 echo "▸ 프로젝트 생성 + Release 빌드(서명 없이)…"
 xcodegen generate >/dev/null
-xcodebuild -project CmdPilot.xcodeproj -scheme CmdPilotHelper -configuration Release \
+./script/xcodebuild-clean.sh -project CmdPilot.xcodeproj -scheme CmdPilotHelper -configuration Release \
   -derivedDataPath ./.release CODE_SIGNING_ALLOWED=NO build >/dev/null
 
 APP_SRC="./.release/Build/Products/Release/$APP_NAME.app"
 
-# 서명: 키체인에 Apple Development 인증서가 있으면 고정 서명(손쉬운 사용 권한이 재빌드 후에도 유지),
-# 없으면 ad-hoc 서명 — 동작은 하지만 재빌드 때마다 손쉬운 사용 권한을 다시 켜야 한다.
-# (인증서 조회가 가끔 깜빡이므로 재시도)
-CERT=""
-for attempt in 1 2 3 4; do
-  CERT=$(security find-identity -v -p codesigning 2>/dev/null | grep -E "Apple Development|CmdSpace Local Signing" | head -1 | awk '{print $2}')
-  [ -n "$CERT" ] && break
-  sleep 1
-done
-if [ -n "$CERT" ] && codesign --force --deep --sign "$CERT" "$APP_SRC" >/dev/null 2>&1 \
-   && codesign -dvv "$APP_SRC" 2>&1 | grep -qE "Apple Development|CmdSpace Local Signing"; then
-  echo "▸ 인증서 재서명 OK ($CERT)"
+# 서명: CODESIGN_IDENTITY를 우선하고, 없으면 Apple Development 또는 유일한 유효 identity를 선택한다.
+# 고정 서명은 손쉬운 사용 권한과 Keychain ACL을 재빌드 후에도 안정적으로 유지한다.
+if ! CERT="$(./script/select-codesign-identity.sh)"; then
+  exit 1
+fi
+if [ -n "$CERT" ]; then
+  if ! codesign --force --deep --sign "$CERT" "$APP_SRC" >/dev/null 2>&1 \
+     || ! codesign --verify --deep --strict "$APP_SRC" >/dev/null 2>&1; then
+    echo "  ❌ 코드 서명 실패 ($CERT). ad-hoc으로 자동 강등하지 않습니다." >&2
+    exit 1
+  fi
+  echo "▸ 고정 identity 서명 OK ($CERT)"
 else
+  if [ "${ALLOW_ADHOC_SIGNING:-0}" != "1" ]; then
+    echo "  ❌ 유효한 코드 서명 identity가 없습니다." >&2
+    echo "     Keychain 통합과 손쉬운 사용 권한을 유지하려면 CODESIGN_IDENTITY를 지정하세요." >&2
+    echo "     기능 저하를 감수하고 임시 빌드하려면 ALLOW_ADHOC_SIGNING=1을 명시하세요." >&2
+    exit 1
+  fi
   codesign --force --deep --sign - "$APP_SRC" >/dev/null 2>&1
-  echo "  ⚠️  Apple Development 인증서 없음 → ad-hoc 서명."
+  echo "  ⚠️  유효한 코드 서명 identity 없음 → ad-hoc 서명."
   echo "     재빌드마다 손쉬운 사용 권한 재부여 필요: 시스템 설정 → 개인정보 보호 및 보안 → 손쉬운 사용 → '$APP_NAME' 껐다 켜기"
-  echo "     (Xcode 에 Apple ID 로그인해 인증서를 만들면 이 번거로움이 사라짐)"
+  echo "     Keychain 기반 cmux/TLS/선택 통합도 다음 재빌드에서 재설정 또는 승인 프롬프트가 필요할 수 있습니다."
 fi
 
 echo "▸ ~/Applications 갱신…"
-rm -rf "$HOME/Applications/$APP_NAME.app"
-ditto "$APP_SRC" "$HOME/Applications/$APP_NAME.app"
+INSTALLED_APP="$HOME/Applications/$APP_NAME.app"
+if [ -e "$INSTALLED_APP" ]; then
+  find "$INSTALLED_APP" -depth -delete
+fi
+ditto "$APP_SRC" "$INSTALLED_APP"
+
+# 개발용 웹 override가 남아 있으면 번들보다 우선 서빙된다. 네이티브/웹 프로토콜을
+# 함께 바꾼 배포에서 구 override가 새 헬퍼를 가리지 않도록 같은 소스로 맞춘다.
+WEB_OVERRIDE="$HOME/Library/Application Support/CmdPilot/web"
+if [ -d "$WEB_OVERRIDE" ]; then
+  echo "▸ 기존 웹 override 동기화…"
+  rsync -a --delete "./MacHelper/Web/" "$WEB_OVERRIDE/"
+fi
 
 # LaunchAgent: plist 가 없으면 생성 (로그인 시 자동 시작 + 죽으면 자동 재시작)
 if [ ! -f "$PLIST" ]; then
